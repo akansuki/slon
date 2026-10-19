@@ -48,8 +48,8 @@ jobs:
           releaseBody: |
             **Windows 10 or later, 64-bit.**
 
-            - `Slon_VERSION_x64-setup.exe` installs for the current user and needs no admin rights. Use this one.
-            - `Slon_VERSION_x64_en-US.msi` installs per machine and needs admin rights. For managed rollouts.
+            - The **`-setup.exe`** below installs for the current user and needs no admin rights. Use this one.
+            - The **`.msi`** installs per machine and needs admin rights. For managed rollouts.
 
             The binaries are not code-signed, so Windows SmartScreen warns on first run:
             choose **More info** then **Run anyway**.
