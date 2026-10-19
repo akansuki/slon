@@ -1,0 +1,58 @@
+name: Release
+
+# Push a tag that matches the version in src-tauri/tauri.conf.json:
+#   git tag v0.1.0 && git push origin v0.1.0
+# The installers are built on a Windows runner and attached to a DRAFT release,
+# so nothing is public until you review the assets and press Publish.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The installer file names come from tauri.conf.json. Without this check a
+      # v0.2.0 tag would quietly publish Slon_0.1.0_x64-setup.exe.
+      - name: Tag must match the app version
+        shell: bash
+        run: |
+          conf=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$conf" != "$tag" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match tauri.conf.json version $conf"
+            exit 1
+          fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: npm ci
+
+      - uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: Slon ${{ github.ref_name }}
+          releaseDraft: true
+          prerelease: false
+          releaseBody: |
+            **Windows 10 or later, 64-bit.**
+
+            - `Slon_VERSION_x64-setup.exe` installs for the current user and needs no admin rights. Use this one.
+            - `Slon_VERSION_x64_en-US.msi` installs per machine and needs admin rights. For managed rollouts.
+
+            The binaries are not code-signed, so Windows SmartScreen warns on first run:
+            choose **More info** then **Run anyway**.
+
+            The WebView2 runtime ships with Windows 11, and with Edge on Windows 10.
+            The installer fetches it if it is missing, which is the one step that needs internet.

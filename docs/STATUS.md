@@ -35,6 +35,12 @@ tests (+1 ignored real credential store), 2 src-tauri tests, 84 UI unit tests, s
 Not verified: Excel opening the exported CSV, Windows certificate store as trust source, real RDS / company CA, plans from other
 server versions (parser written against PG 16 JSON; PG 18 adds fields it ignores).
 
+## Releases
+`.github/workflows/release.yml` builds on a Windows runner when a `v*` tag is pushed and attaches both installers to a
+**draft** release, so the assets are reviewed before anything is public. A guard step fails the run when the tag does not
+match the version in `src-tauri/tauri.conf.json`, which is what names the installer files; keep `package.json` and
+`src-tauri/Cargo.toml` in step with it when bumping. Releases are unsigned (see the Next list).
+
 ## Screenshots
 `e2e/screenshots.mjs` drives the real app through tauri-driver and writes `docs/img/*.png`; `e2e/demo.sql` is the
 schema they are taken against. The committed set was rendered from a release build on Linux/WebKitGTK, whose fallback monospace font is
