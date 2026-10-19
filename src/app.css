@@ -1,0 +1,115 @@
+:root {
+  color-scheme: light dark;
+  --bg: #f4f6f9;
+  --panel: #ffffff;
+  --panel-2: #eef1f5;
+  --border: #dbe0e7;
+  --text: #1b2330;
+  --muted: #667285;
+  --accent: #2f6fa7;
+  --accent-hover: #285f90;
+  --accent-fg: #ffffff;
+  --danger: #b83232;
+  --danger-bg: #fdeeee;
+  --warn: #7a5600;
+  --warn-bg: #fff4d6;
+  --hover: #e8edf4;
+  --selected: #d6e5f6;
+  --null: #98a2b1;
+  --stripe: #f8fafc;
+  --mono: ui-monospace, 'Cascadia Mono', 'Cascadia Code', Consolas, 'SF Mono', Menlo, monospace;
+  --ui: 'Segoe UI Variable Text', 'Segoe UI', system-ui, -apple-system, 'Helvetica Neue', sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #12161c;
+    --panel: #1a2029;
+    --panel-2: #212835;
+    --border: #2c3544;
+    --text: #e3e8ef;
+    --muted: #8b97a8;
+    --accent: #5b9bd5;
+    --accent-hover: #75aee0;
+    --accent-fg: #0c1420;
+    --danger: #ff8b8b;
+    --danger-bg: #3a1f23;
+    --warn: #ebc96f;
+    --warn-bg: #3a3118;
+    --hover: #252e3c;
+    --selected: #284058;
+    --null: #66738a;
+    --stripe: #1d2430;
+  }
+}
+
+* { box-sizing: border-box; }
+
+html, body, #app { height: 100%; margin: 0; }
+
+body {
+  font-family: var(--ui);
+  font-size: 13px;
+  color: var(--text);
+  background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+[hidden] { display: none !important; }
+
+button, input, select { font: inherit; color: inherit; }
+
+button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+  cursor: pointer;
+}
+button:hover:not(:disabled) { background: var(--hover); }
+button:disabled { opacity: 0.45; cursor: default; }
+button:focus-visible, input:focus-visible, select:focus-visible, [tabindex]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-fg);
+  font-weight: 600;
+}
+button.primary:hover:not(:disabled) { background: var(--accent-hover); }
+
+button.ghost {
+  border-color: transparent;
+  background: transparent;
+  padding: 0 6px;
+}
+button.ghost:hover:not(:disabled) { background: var(--hover); }
+
+/* Checkboxes and radios keep their native size: the box below is for text fields. */
+input:not([type='checkbox']):not([type='radio']), select {
+  height: 30px;
+  width: 100%;
+  padding: 0 9px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+}
+
+.spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+  flex: none;
+}
+@keyframes spin { to { transform: rotate(360deg); } }

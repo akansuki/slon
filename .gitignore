@@ -1,0 +1,25 @@
+# Build output
+/target/
+/dist/
+node_modules/
+src-tauri/gen/
+
+# Test artefacts
+e2e/shots/
+*.log
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Secrets and local settings: never commit
+.env
+.env.*
+*.pem
+*.key
+
+# Temporary files
+*.tmp
+*.bad

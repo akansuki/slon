@@ -1,0 +1,16 @@
+[package]
+name = "pg-core"
+version = "0.1.0"
+edition = "2021"
+description = "PostgreSQL connection, catalog and query engine for the slon desktop client"
+license = "MIT"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio-postgres = "0.7"
+tokio-postgres-rustls = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1", features = ["derive"] }
+futures-util = "0.3"
+# Trusted CA certificates of the operating system (Windows certificate store, ...).
+rustls-native-certs = "0.8"

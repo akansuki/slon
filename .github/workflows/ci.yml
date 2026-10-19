@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  ui:
+    name: UI (vitest, svelte-check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm run check
+
+  rust:
+    name: Rust (engine against a real PostgreSQL)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --all -- --check
+      # The Tauri shell needs the GTK/WebKit system libraries, so only the two
+      # UI-free crates are checked and tested here.
+      - run: cargo clippy -p pg-core -p pg-profiles --all-targets -- -D warnings
+      - run: cargo test -p pg-profiles
+
+      # A throwaway cluster with TLS and a private CA, as used locally.
+      - name: Start PostgreSQL
+        run: bash scripts/test-db.sh start | sed 's/^export //' | tr ' ' '\n' >> "$GITHUB_ENV"
+      - run: cargo test -p pg-core
+        env:
+          SLON_REQUIRE_DB: 1

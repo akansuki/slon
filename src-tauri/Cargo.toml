@@ -1,0 +1,20 @@
+[package]
+name = "slon"
+version = "0.1.0"
+edition = "2021"
+description = "A lightweight PostgreSQL client"
+license = "MIT"
+
+[lib]
+name = "slon_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+pg-core = { path = "../crates/pg-core" }
+pg-profiles = { path = "../crates/pg-profiles" }
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+tauri-plugin-dialog = "2"
