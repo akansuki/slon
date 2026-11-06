@@ -509,6 +509,136 @@ try {
   await browser.keys('Enter');
   check('Enter resets to the default', (await sidebarW()) === 290, String(await sidebarW()));
 
+  /* ---------- deleting rows from the grid */
+  const gridRows = () =>
+    browser.execute(() =>
+      [...document.querySelectorAll('.bodies > .body:not([hidden]) .grid .row')].map((r) =>
+        r.innerText.split('\n').map((s) => s.trim()).filter(Boolean),
+      ),
+    );
+  // A real click, because the grid hit-tests by coordinates and a synthetic event would
+  // land on row 0. The row is found by textContent: WebKit's getText comes back empty here.
+  const selectRowNumber = async (n) => {
+    const i = await browser.execute(
+      (num) =>
+        [...document.querySelectorAll('.bodies > .body:not([hidden]) .grid .row .cell.num')]
+          .findIndex((c) => c.textContent.trim() === String(num)),
+      n,
+    );
+    if (i < 0) throw new Error(`row number ${n} is not on screen`);
+    await (await browser.$$(`${ACTIVE} .grid .row .cell.num`))[i].click();
+  };
+  const deleteBtn = () => browser.$(`${ACTIVE} [data-testid=delete-rows]`);
+  const deleteTitle = () =>
+    browser.execute(() =>
+      document.querySelector('.bodies > .body:not([hidden]) [data-testid=delete-rows]')?.title,
+    );
+  const sel = (t) => browser.execute((x) => document.querySelector(`[data-testid=${x}]`)?.textContent, t);
+
+  await run(`DROP SCHEMA IF EXISTS e2e_del CASCADE;
+             CREATE SCHEMA e2e_del;
+             CREATE TABLE e2e_del.items (id int PRIMARY KEY, label text);
+             CREATE TABLE e2e_del.keyless (x int);
+             INSERT INTO e2e_del.items SELECT g, 'row ' || g FROM generate_series(1, 5) g;
+             INSERT INTO e2e_del.keyless VALUES (1);`);
+  await idle();
+
+  // Not offered when the rows cannot be traced to one table.
+  await run('SELECT count(*) FROM e2e_del.items');
+  await idle();
+  check('Delete is refused for a computed result', !(await (await deleteBtn()).isEnabled()));
+  check('and says why', /single table/.test(String(await deleteTitle())), String(await deleteTitle()));
+
+  await run('SELECT * FROM e2e_del.keyless');
+  await idle();
+  await sleep(600); // the identity lookup is a background round trip
+  check('Delete is refused without a primary key', !(await (await deleteBtn()).isEnabled()));
+  check('and names the problem', /no primary key/.test(String(await deleteTitle())), String(await deleteTitle()));
+
+  await run('SELECT label FROM e2e_del.items');
+  await idle();
+  await sleep(600);
+  check('Delete is refused when the key is not in the result', !(await (await deleteBtn()).isEnabled()));
+  check('and names the column to add', /\(id\)/.test(String(await deleteTitle())), String(await deleteTitle()));
+
+  // The real thing.
+  await run('SELECT * FROM e2e_del.items ORDER BY id');
+  await idle();
+  await sleep(600);
+  check('Delete needs a selection first', !(await (await deleteBtn()).isEnabled()));
+  check('and asks for one', /row number/.test(String(await deleteTitle())), String(await deleteTitle()));
+
+  await selectRowNumber(2);
+  await until(async () => (await deleteBtn()).isEnabled(), 'Delete stayed disabled after selecting a row');
+  await click(`${ACTIVE} [data-testid=delete-rows]`);
+  await until(async () => (await browser.$('[data-testid=delete-sql]')).isExisting(), 'no delete dialog');
+  const dialogSql = await sel('delete-sql');
+  check('the dialog shows the statement that will run',
+    dialogSql === "DELETE FROM e2e_del.items\nWHERE id IN ('2')", JSON.stringify(dialogSql));
+  check('and names the table and key', /e2e_del\.items/.test(String(await sel('delete-summary'))), String(await sel('delete-summary')));
+  await shot('24-delete');
+
+  // Cancelling changes nothing.
+  await click('[data-testid=delete-cancel]');
+  await until(async () => !(await (await browser.$('[data-testid=delete-dialog]')).isExisting()), 'dialog did not close');
+  check('cancelling leaves the rows alone', (await gridRows()).length === 5);
+
+  await click(`${ACTIVE} [data-testid=delete-rows]`);
+  await until(async () => (await browser.$('[data-testid=delete-confirm]')).isExisting(), 'no dialog second time');
+  await click('[data-testid=delete-confirm]');
+  await until(async () => !(await (await browser.$('[data-testid=delete-dialog]')).isExisting()), 'dialog stayed open');
+  const afterOne = await gridRows();
+  check('the deleted row leaves the grid', afterOne.length === 4 && !afterOne.some((r) => r[1] === '2'), JSON.stringify(afterOne));
+  const deleteToast = await browser.execute(() => document.querySelector('[data-testid=notice]')?.textContent);
+  check('and is reported', /Deleted 1 row/.test(String(deleteToast)), String(deleteToast));
+
+  // It really went from the table, not just from the grid.
+  await run('SELECT id FROM e2e_del.items ORDER BY id');
+  await idle();
+  check('the row is gone from the table', JSON.stringify((await gridRows()).map((r) => r[1])) === '["1","3","4","5"]',
+    JSON.stringify((await gridRows()).map((r) => r[1])));
+
+  // Sorting shows a permutation: the row deleted must be the one on screen, not the one
+  // that happens to sit at that position in arrival order.
+  await run('SELECT * FROM e2e_del.items ORDER BY id');
+  await idle();
+  await sleep(600);
+  await clickHead('id');
+  await clickHead('id'); // descending: first visual row is now id 5
+  await sleep(300);
+  const firstSorted = (await gridRows())[0];
+  check('the grid is sorted descending', firstSorted[1] === '5', JSON.stringify(firstSorted));
+  await selectRowNumber(1);
+  await until(async () => (await deleteBtn()).isEnabled(), 'Delete disabled after selecting a sorted row');
+  await click(`${ACTIVE} [data-testid=delete-rows]`);
+  await until(async () => (await browser.$('[data-testid=delete-sql]')).isExisting(), 'no dialog for sorted row');
+  check('the statement names the row shown, not the row at that index',
+    (await sel('delete-sql')) === "DELETE FROM e2e_del.items\nWHERE id IN ('5')", String(await sel('delete-sql')));
+  await click('[data-testid=delete-confirm]');
+  await until(async () => !(await (await browser.$('[data-testid=delete-dialog]')).isExisting()), 'sorted delete dialog stayed open');
+  await run('SELECT id FROM e2e_del.items ORDER BY id');
+  await idle();
+  check('the right row was deleted after sorting', JSON.stringify((await gridRows()).map((r) => r[1])) === '["1","3","4"]',
+    JSON.stringify((await gridRows()).map((r) => r[1])));
+
+  // Several rows at once.
+  await run('SELECT * FROM e2e_del.items ORDER BY id');
+  await idle();
+  await sleep(600);
+  await selectRowNumber(1);
+  await browser.keys(['Shift', 'ArrowDown']); // extend the whole-row selection downwards
+  await until(async () => (await deleteBtn()).isEnabled(), 'Delete disabled for a multi-row selection');
+  await click(`${ACTIVE} [data-testid=delete-rows]`);
+  await until(async () => (await browser.$('[data-testid=delete-sql]')).isExisting(), 'no dialog for two rows');
+  check('two rows give one statement listing both',
+    (await sel('delete-sql')) === "DELETE FROM e2e_del.items\nWHERE id IN ('1', '3')", String(await sel('delete-sql')));
+  await click('[data-testid=delete-confirm]');
+  await until(async () => !(await (await browser.$('[data-testid=delete-dialog]')).isExisting()), 'two-row dialog stayed open');
+  await run('SELECT id FROM e2e_del.items');
+  await idle();
+  check('both rows are gone', JSON.stringify((await gridRows()).map((r) => r[1])) === '["4"]',
+    JSON.stringify((await gridRows()).map((r) => r[1])));
+
   /* ---------- export of results */
   const exportedFiles = () => readdirSync(EXPORT_DIR).sort();
   const clearExports = () => exportedFiles().forEach((f) => rmSync(join(EXPORT_DIR, f)));

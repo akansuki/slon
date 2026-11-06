@@ -17,6 +17,8 @@ import type { Column } from './types';
 const col = (name: string, typeName: string | null = null): Column => ({
   name,
   typeName,
+  tableOid: null,
+  columnId: null,
   sortKind: typeName === 'int4' ? 'number' : 'text',
 });
 const opts = (over: Partial<ExportOptions> = {}): ExportOptions => ({ ...DEFAULT_OPTIONS, ...over });

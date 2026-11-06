@@ -1306,3 +1306,390 @@ async fn table_details_list_triggers_and_sequences_and_the_script_replays() {
         .0
         .expect("cleanup");
 }
+
+/// The table OID the server reported for a result column, which is what the grid keys on.
+fn table_oid_of(columns: &[Column]) -> Option<u32> {
+    let oids: Vec<_> = columns.iter().filter_map(|c| c.table_oid).collect();
+    match oids.first() {
+        Some(first) if oids.len() == columns.len() && oids.iter().all(|o| o == first) => {
+            Some(*first)
+        }
+        _ => None,
+    }
+}
+
+/// Each test gets its own schema, because they run in parallel against one database.
+async fn setup_delete_schema(reg: &Registry, t: u64, schema: &str) {
+    let (r, _) = run(
+        reg,
+        t,
+        &format!(
+            "DROP SCHEMA IF EXISTS {schema} CASCADE;
+             CREATE SCHEMA {schema};
+             CREATE TABLE {schema}.items (id int PRIMARY KEY, label text);
+             CREATE TABLE {schema}.pairs (a text, b int, note text, PRIMARY KEY (a, b));
+             CREATE TABLE {schema}.keyless (x int);
+             CREATE VIEW {schema}.items_v AS SELECT * FROM {schema}.items;
+             INSERT INTO {schema}.items SELECT g, 'row ' || g FROM generate_series(1, 5) g;
+             INSERT INTO {schema}.keyless VALUES (1);"
+        ),
+        &QueryOptions::default(),
+    )
+    .await;
+    r.expect("setup");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_server_says_which_table_each_result_column_came_from() {
+    let cfg = cfg_or_skip!();
+    let reg = Registry::new();
+    let t = tab(&reg, &cfg).await;
+    setup_delete_schema(&reg, t, "slon_del_src").await;
+
+    // A plain select: every column carries the same table, and its position in it.
+    let (_, c) = run(
+        &reg,
+        t,
+        "SELECT label, id AS renamed FROM slon_del_src.items ORDER BY id",
+        &QueryOptions::default(),
+    )
+    .await;
+    let cols = &c.columns[0];
+    let oid = table_oid_of(cols).expect("one source table");
+    // Renaming a column does not change the attnum, which is how the key is found.
+    assert_eq!(cols[1].name, "renamed");
+    assert_eq!(cols[1].column_id, Some(1));
+    assert_eq!(cols[0].column_id, Some(2));
+
+    let id = reg.row_identity(t, oid).await.unwrap();
+    assert_eq!(
+        (id.schema.as_str(), id.table.as_str()),
+        ("slon_del_src", "items")
+    );
+    assert_eq!(id.qualified, "slon_del_src.items");
+    assert_eq!(id.key.len(), 1);
+    assert_eq!(id.key[0].name, "id");
+    assert_eq!(id.key[0].attnum, 1);
+
+    // Computed columns have no source, so a result holding one is not deletable.
+    let (_, c) = run(
+        &reg,
+        t,
+        "SELECT count(*) FROM slon_del_src.items",
+        &QueryOptions::default(),
+    )
+    .await;
+    assert_eq!(c.columns[0][0].table_oid, None);
+    assert!(table_oid_of(&c.columns[0]).is_none());
+
+    // Neither is a join: the columns disagree about where they came from.
+    let (_, c) = run(
+        &reg,
+        t,
+        "SELECT i.id, p.note FROM slon_del_src.items i CROSS JOIN slon_del_src.pairs p",
+        &QueryOptions::default(),
+    )
+    .await;
+    assert!(table_oid_of(&c.columns[0]).is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rows_without_a_reliable_identity_are_refused() {
+    let cfg = cfg_or_skip!();
+    let reg = Registry::new();
+    let t = tab(&reg, &cfg).await;
+    setup_delete_schema(&reg, t, "slon_del_id").await;
+
+    async fn oid_of(reg: &Registry, t: u64, sql: &str) -> u32 {
+        let (_, c) = run(reg, t, sql, &QueryOptions::default()).await;
+        table_oid_of(&c.columns[0]).expect("a source table")
+    }
+
+    let view_oid = oid_of(&reg, t, "SELECT * FROM slon_del_id.items_v").await;
+    let err = reg.row_identity(t, view_oid).await.unwrap_err();
+    assert!(err.message.contains("view"), "{}", err.message);
+
+    let keyless_oid = oid_of(&reg, t, "SELECT * FROM slon_del_id.keyless").await;
+    let err = reg.row_identity(t, keyless_oid).await.unwrap_err();
+    assert!(err.message.contains("no primary key"), "{}", err.message);
+
+    // An OID that is not a relation at all.
+    let err = reg.row_identity(t, 1).await.unwrap_err();
+    assert!(!err.message.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_builds_the_statement_it_runs_and_removes_exactly_those_rows() {
+    let cfg = cfg_or_skip!();
+    let reg = Registry::new();
+    let t = tab(&reg, &cfg).await;
+    setup_delete_schema(&reg, t, "slon_del_one").await;
+
+    let (_, c) = run(
+        &reg,
+        t,
+        "SELECT * FROM slon_del_one.items",
+        &QueryOptions::default(),
+    )
+    .await;
+    let oid = table_oid_of(&c.columns[0]).unwrap();
+
+    let req = DeleteRequest {
+        table_oid: oid,
+        rows: vec![vec!["2".into()], vec!["4".into()]],
+    };
+    let plan = reg.plan_delete(t, &req).await.unwrap();
+    assert_eq!(
+        plan.sql,
+        "DELETE FROM slon_del_one.items\nWHERE id IN ('2', '4')"
+    );
+    assert_eq!(plan.row_count, 2);
+
+    // Planning alone changes nothing.
+    let (_, c) = run(
+        &reg,
+        t,
+        "SELECT count(*) FROM slon_del_one.items",
+        &QueryOptions::default(),
+    )
+    .await;
+    assert_eq!(c.rows[0][0][0], s("5"));
+
+    let out = reg.delete_rows(t, &req).await.unwrap();
+    assert_eq!(out.deleted, 2);
+    assert_eq!(out.sql, plan.sql, "the preview must be what ran");
+
+    let (_, c) = run(
+        &reg,
+        t,
+        "SELECT id FROM slon_del_one.items ORDER BY id",
+        &QueryOptions::default(),
+    )
+    .await;
+    let left: Vec<_> = c.rows[0].iter().map(|r| r[0].clone()).collect();
+    assert_eq!(left, vec![s("1"), s("3"), s("5")]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_composite_key_is_matched_column_by_column() {
+    let cfg = cfg_or_skip!();
+    let reg = Registry::new();
+    let t = tab(&reg, &cfg).await;
+    setup_delete_schema(&reg, t, "slon_del_pair").await;
+    run(
+        &reg,
+        t,
+        "INSERT INTO slon_del_pair.pairs VALUES ('x', 1, 'keep'), ('x', 2, 'go'), ('y', 1, 'go')",
+        &QueryOptions::default(),
+    )
+    .await
+    .0
+    .unwrap();
+
+    let (_, c) = run(
+        &reg,
+        t,
+        "SELECT * FROM slon_del_pair.pairs",
+        &QueryOptions::default(),
+    )
+    .await;
+    let oid = table_oid_of(&c.columns[0]).unwrap();
+    let req = DeleteRequest {
+        table_oid: oid,
+        rows: vec![vec!["x".into(), "2".into()], vec!["y".into(), "1".into()]],
+    };
+    let plan = reg.plan_delete(t, &req).await.unwrap();
+    assert_eq!(
+        plan.sql,
+        "DELETE FROM slon_del_pair.pairs\nWHERE (a = 'x' AND b = '2')\n   OR (a = 'y' AND b = '1')"
+    );
+    assert_eq!(reg.delete_rows(t, &req).await.unwrap().deleted, 2);
+
+    let (_, c) = run(
+        &reg,
+        t,
+        "SELECT note FROM slon_del_pair.pairs",
+        &QueryOptions::default(),
+    )
+    .await;
+    assert_eq!(c.rows[0].len(), 1);
+    assert_eq!(c.rows[0][0][0], s("keep"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn key_values_are_quoted_by_the_server_so_they_cannot_be_sql() {
+    let cfg = cfg_or_skip!();
+    let reg = Registry::new();
+    let t = tab(&reg, &cfg).await;
+    setup_delete_schema(&reg, t, "slon_del_quote").await;
+
+    // Values that would be an injection, or break the statement, if pasted in raw.
+    let nasty = "'); DROP TABLE slon_del_quote.items; --";
+    let quotes = "O'Brien \\ \"x\"";
+    run(
+        &reg,
+        t,
+        "INSERT INTO slon_del_quote.pairs VALUES ($$'); DROP TABLE slon_del_quote.items; --$$, 1, 'go'),
+                                           ($$O'Brien \\ \"x\"$$, 2, 'go'),
+                                           ('safe', 3, 'keep')",
+        &QueryOptions::default(),
+    )
+    .await
+    .0
+    .unwrap();
+
+    let (_, c) = run(
+        &reg,
+        t,
+        "SELECT * FROM slon_del_quote.pairs",
+        &QueryOptions::default(),
+    )
+    .await;
+    let oid = table_oid_of(&c.columns[0]).unwrap();
+    let req = DeleteRequest {
+        table_oid: oid,
+        rows: vec![
+            vec![nasty.into(), "1".into()],
+            vec![quotes.into(), "2".into()],
+        ],
+    };
+    let out = reg.delete_rows(t, &req).await.unwrap();
+    assert_eq!(out.deleted, 2);
+
+    // The table is still there and kept the row it should have.
+    let (_, c) = run(
+        &reg,
+        t,
+        "SELECT note FROM slon_del_quote.pairs",
+        &QueryOptions::default(),
+    )
+    .await;
+    assert_eq!(c.rows[0].len(), 1);
+    assert_eq!(c.rows[0][0][0], s("keep"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn nothing_is_deleted_when_the_count_does_not_match() {
+    let cfg = cfg_or_skip!();
+    let reg = Registry::new();
+    let t = tab(&reg, &cfg).await;
+    setup_delete_schema(&reg, t, "slon_del_count").await;
+
+    let (_, c) = run(
+        &reg,
+        t,
+        "SELECT * FROM slon_del_count.items",
+        &QueryOptions::default(),
+    )
+    .await;
+    let oid = table_oid_of(&c.columns[0]).unwrap();
+
+    // One of these rows is already gone, so the statement would match fewer rows than
+    // were selected: the whole thing must roll back.
+    let err = reg
+        .delete_rows(
+            t,
+            &DeleteRequest {
+                table_oid: oid,
+                rows: vec![vec!["1".into()], vec!["999".into()]],
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.message.contains("Nothing was deleted"),
+        "{}",
+        err.message
+    );
+
+    let (_, c) = run(
+        &reg,
+        t,
+        "SELECT count(*) FROM slon_del_count.items",
+        &QueryOptions::default(),
+    )
+    .await;
+    assert_eq!(c.rows[0][0][0], s("5"), "row 1 must still be there");
+
+    // Empty and oversized selections are refused before anything runs.
+    let empty = reg
+        .delete_rows(
+            t,
+            &DeleteRequest {
+                table_oid: oid,
+                rows: vec![],
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(empty.message.contains("No rows"), "{}", empty.message);
+    let too_many = reg
+        .delete_rows(
+            t,
+            &DeleteRequest {
+                table_oid: oid,
+                rows: vec![vec!["1".into()]; MAX_DELETE_ROWS + 1],
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(too_many.message.contains("at most"), "{}", too_many.message);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delete_inside_the_users_transaction_leaves_it_open() {
+    let cfg = cfg_or_skip!();
+    let reg = Registry::new();
+    let t = tab(&reg, &cfg).await;
+    setup_delete_schema(&reg, t, "slon_del_txn").await;
+
+    let (_, c) = run(
+        &reg,
+        t,
+        "SELECT * FROM slon_del_txn.items",
+        &QueryOptions::default(),
+    )
+    .await;
+    let oid = table_oid_of(&c.columns[0]).unwrap();
+
+    run(&reg, t, "BEGIN", &QueryOptions::default())
+        .await
+        .0
+        .unwrap();
+    run(
+        &reg,
+        t,
+        "INSERT INTO slon_del_txn.items VALUES (99, 'mine')",
+        &QueryOptions::default(),
+    )
+    .await
+    .0
+    .unwrap();
+
+    let out = reg
+        .delete_rows(
+            t,
+            &DeleteRequest {
+                table_oid: oid,
+                rows: vec![vec!["3".into()]],
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.deleted, 1);
+
+    // The user's transaction is still open and still holds their own insert, so rolling
+    // it back must undo the grid delete too.
+    run(&reg, t, "ROLLBACK", &QueryOptions::default())
+        .await
+        .0
+        .unwrap();
+    let (_, c) = run(
+        &reg,
+        t,
+        "SELECT count(*) FROM slon_del_txn.items",
+        &QueryOptions::default(),
+    )
+    .await;
+    assert_eq!(c.rows[0][0][0], s("5"));
+}

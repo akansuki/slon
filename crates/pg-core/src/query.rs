@@ -27,6 +27,12 @@ pub struct Column {
     pub name: String,
     pub type_name: Option<String>,
     pub sort_kind: SortKind,
+    /// The table this column was read from, as the server reported it. `None` for anything
+    /// computed (an expression, an aggregate, a literal). This is what lets the grid work
+    /// out whether a row can be deleted.
+    pub table_oid: Option<u32>,
+    /// The column's position in that table (`attnum`), which survives renaming in the query.
+    pub column_id: Option<i16>,
 }
 
 fn sort_kind_for(t: &Type) -> SortKind {
@@ -143,6 +149,8 @@ where
                 name: c.name().to_string(),
                 type_name: Some(c.type_().name().to_string()),
                 sort_kind: sort_kind_for(c.type_()),
+                table_oid: c.table_oid(),
+                column_id: c.column_id(),
             })
             .collect()
     });
@@ -226,10 +234,14 @@ where
                     Some(d) if d.len() == cols.len() => d.clone(),
                     _ => cols
                         .iter()
+                        // A script: the prepare that carries types and column sources only
+                        // works for a single statement, so these rows are not deletable.
                         .map(|c| Column {
                             name: c.name().to_string(),
                             type_name: None,
                             sort_kind: SortKind::Unknown,
+                            table_oid: None,
+                            column_id: None,
                         })
                         .collect(),
                 };

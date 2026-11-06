@@ -1,6 +1,7 @@
 use pg_core::{
-    CompletionSchema, ConnectionConfig, ConnectionInfo, ExplainResult, PgError, QueryEvent,
-    QueryOptions, Registry, Relation, TableDetails,
+    CompletionSchema, ConnectionConfig, ConnectionInfo, DeleteOutcome, DeletePlan, DeleteRequest,
+    ExplainResult, PgError, QueryEvent, QueryOptions, Registry, Relation, RowIdentity,
+    TableDetails,
 };
 use pg_profiles::{
     HistoryEntry, HistoryInput, HistoryStore, KeyringSecrets, MemorySecrets, Profile, ProfileInput,
@@ -204,6 +205,33 @@ async fn explain(
 }
 
 #[tauri::command]
+async fn row_identity(
+    state: State<'_, AppState>,
+    tab_id: u64,
+    table_oid: u32,
+) -> Result<RowIdentity, PgError> {
+    state.registry.row_identity(tab_id, table_oid).await
+}
+
+#[tauri::command]
+async fn plan_delete(
+    state: State<'_, AppState>,
+    tab_id: u64,
+    request: DeleteRequest,
+) -> Result<DeletePlan, PgError> {
+    state.registry.plan_delete(tab_id, &request).await
+}
+
+#[tauri::command]
+async fn delete_rows(
+    state: State<'_, AppState>,
+    tab_id: u64,
+    request: DeleteRequest,
+) -> Result<DeleteOutcome, PgError> {
+    state.registry.delete_rows(tab_id, &request).await
+}
+
+#[tauri::command]
 fn history_add(state: State<'_, AppState>, input: HistoryInput) -> Result<bool, PgError> {
     state.history.add(input)
 }
@@ -293,6 +321,9 @@ pub fn run() {
             run_query,
             explain,
             cancel_query,
+            row_identity,
+            plan_delete,
+            delete_rows,
             build_info,
             set_window_title,
             history_add,

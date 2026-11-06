@@ -2,6 +2,9 @@ import { Channel, invoke } from '@tauri-apps/api/core';
 import type {
   BuildInfo,
   Cell,
+  DeleteOutcome,
+  DeletePlan,
+  DeleteRequest,
   CompletionSchema,
   ConnectionConfig,
   ConnectionInfo,
@@ -14,6 +17,7 @@ import type {
   QueryEvent,
   QuerySummary,
   Relation,
+  RowIdentity,
   TableDetails,
   Workspace,
 } from './types';
@@ -63,6 +67,12 @@ export const api = {
     call<void>('write_export', { path, text, append }),
   buildInfo: () => call<BuildInfo>('build_info'),
   setWindowTitle: (title: string) => call<void>('set_window_title', { title }),
+  rowIdentity: (tabId: number, tableOid: number) =>
+    call<RowIdentity>('row_identity', { tabId, tableOid }),
+  planDelete: (tabId: number, request: DeleteRequest) =>
+    call<DeletePlan>('plan_delete', { tabId, request }),
+  deleteRows: (tabId: number, request: DeleteRequest) =>
+    call<DeleteOutcome>('delete_rows', { tabId, request }),
   historyAdd: (input: HistoryInput) => call<boolean>('history_add', { input }),
   historyList: (search: string | null, server: string | null, limit = 200) =>
     call<HistoryEntry[]>('history_list', { search, server, limit }),

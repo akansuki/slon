@@ -2,12 +2,16 @@ import { api, toPgError } from './api';
 import { looksLikeDdl, quoteIfNeeded } from './completion';
 import { parsePlan, type ParsedPlan } from './plan';
 import { diagnostics } from './about';
+import { keyIndexes, keyValues, sourceTableOid } from './rowdelete';
 import { copyText } from './selection';
 import type { SortSpec } from './sort';
 import type {
   BuildInfo,
   Cell,
   Column,
+  DeleteOutcome,
+  DeletePlan,
+  RowIdentity,
   CompletionSchema,
   ConnectionConfig,
   ConnectionInfo,
@@ -42,6 +46,15 @@ export class QueryTab {
   truncated = $state(false);
   /** Sort chosen in the grid (kept here so an export follows the order on screen). */
   sort = $state<SortSpec | null>(null);
+  /** Indexes into `rows` of the whole rows selected in the grid, reported by it. */
+  selectedRows = $state.raw<number[]>([]);
+
+  // Where these rows came from, resolved once per result so the Delete action knows
+  // whether it can offer anything. Null table means "not from a single table".
+  tableOid = $state<number | null>(null);
+  identity = $state.raw<RowIdentity | null>(null);
+  identityError = $state<string | null>(null);
+  private identitySeq = 0;
 
   /** Text for non-row results ("INSERT 0 3"-style) and the status bar. */
   message = $state<string | null>(null);
@@ -245,7 +258,65 @@ export class QueryTab {
       this.flushMessages();
       // Rows turned up after all: they are what the person wants to see.
       if (switchedToMessages && this.columns.length > 0) this.view = 'results';
+      void this.resolveIdentity();
     }
+  }
+
+  /**
+   * Work out which table these rows belong to, so the grid knows whether Delete can be
+   * offered. One catalog query, in the background, and only when the columns agree on a
+   * single source table.
+   */
+  private async resolveIdentity() {
+    const mine = ++this.identitySeq;
+    const oid = sourceTableOid(this.columns);
+    this.tableOid = oid;
+    this.identity = null;
+    this.identityError = null;
+    this.selectedRows = [];
+    if (oid === null || this.backendId === null) return;
+    try {
+      const id = await api.rowIdentity(this.backendId, oid);
+      if (mine === this.identitySeq) this.identity = id;
+    } catch (e) {
+      // Not an error the person asked for: it only greys out the button and explains why.
+      if (mine === this.identitySeq) this.identityError = toPgError(e).message;
+    }
+  }
+
+  /** The key values of the selected rows, or null when they cannot be identified. */
+  private selectedKeys(): string[][] | null {
+    if (!this.identity) return null;
+    const indexes = keyIndexes(this.columns, this.identity);
+    if (!indexes) return null;
+    return keyValues(this.rows, this.selectedRows, indexes);
+  }
+
+  /** The statement that deleting the selection would run, for the confirmation. */
+  async planDelete(): Promise<DeletePlan> {
+    const rows = this.selectedKeys();
+    if (this.backendId === null || this.tableOid === null || !rows) {
+      throw new Error('These rows cannot be identified.');
+    }
+    return api.planDelete(this.backendId, { tableOid: this.tableOid, rows });
+  }
+
+  /**
+   * Delete the selected rows, then drop them from the grid. The backend rolls back unless
+   * exactly the selected rows were deleted, so reaching here means the grid and the table
+   * agree again.
+   */
+  async deleteSelected(): Promise<DeleteOutcome> {
+    const rows = this.selectedKeys();
+    if (this.backendId === null || this.tableOid === null || !rows) {
+      throw new Error('These rows cannot be identified.');
+    }
+    const out = await api.deleteRows(this.backendId, { tableOid: this.tableOid, rows });
+    const gone = new Set(this.selectedRows);
+    this.rows = this.rows.filter((_, i) => !gone.has(i));
+    this.selectedRows = [];
+    this.rowsVersion++;
+    return out;
   }
 
   /**

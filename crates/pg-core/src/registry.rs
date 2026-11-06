@@ -9,6 +9,7 @@ use crate::config::ConnectionConfig;
 use crate::error::PgError;
 use crate::explain::{self, ExplainResult};
 use crate::query::{self, QueryEvent, QueryOptions, QuerySummary};
+use crate::rowdelete::{self, DeleteOutcome, DeletePlan, DeleteRequest, RowIdentity};
 use crate::session::Session;
 
 #[derive(Debug, Clone, Serialize)]
@@ -213,6 +214,32 @@ impl Registry {
     ) -> Result<ExplainResult, PgError> {
         let session = self.tab_session(tab_id)?;
         explain::run_explain(&session, sql, analyze).await
+    }
+
+    /// The table and primary key behind a result column's table OID.
+    pub async fn row_identity(&self, tab_id: u64, table_oid: u32) -> Result<RowIdentity, PgError> {
+        let session = self.tab_session(tab_id)?;
+        rowdelete::row_identity(&session, table_oid).await
+    }
+
+    /// The DELETE that `delete_rows` would run, for the confirmation dialog.
+    pub async fn plan_delete(
+        &self,
+        tab_id: u64,
+        req: &DeleteRequest,
+    ) -> Result<DeletePlan, PgError> {
+        let session = self.tab_session(tab_id)?;
+        rowdelete::plan_delete(&session, req).await
+    }
+
+    /// Deletes the selected rows, rolling back unless exactly they were deleted.
+    pub async fn delete_rows(
+        &self,
+        tab_id: u64,
+        req: &DeleteRequest,
+    ) -> Result<DeleteOutcome, PgError> {
+        let session = self.tab_session(tab_id)?;
+        rowdelete::run_delete(&session, req).await
     }
 
     /// Cancels the statement running in `tab_id`. Safe to call when nothing is running.

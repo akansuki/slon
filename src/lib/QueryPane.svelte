@@ -1,5 +1,7 @@
 <script lang="ts">
+  import { deletability } from './rowdelete';
   import Editor from './Editor.svelte';
+  import DeleteDialog from './DeleteDialog.svelte';
   import ExportDialog from './ExportDialog.svelte';
   import Grid from './Grid.svelte';
   import Icon from './Icon.svelte';
@@ -16,6 +18,11 @@
 
   const running = $derived(tab.status === 'running');
   let exporting = $state(false);
+  let deleting = $state(false);
+  let grid = $state<ReturnType<typeof Grid> | null>(null);
+  const canDelete = $derived(
+    deletability(tab.columns, tab.identity, tab.identityError, tab.selectedRows, running),
+  );
   const canExport = $derived(tab.columns.length > 0 && tab.status === 'idle' && tab.rows.length > 0);
 
   function run() {
@@ -79,6 +86,17 @@
   });
 </script>
 
+{#if deleting}
+  <DeleteDialog
+    {tab}
+    onclose={() => (deleting = false)}
+    ondone={(m) => {
+      grid?.clearSelection();
+      app.flash(m);
+    }}
+  />
+{/if}
+
 {#if exporting}
   <ExportDialog
     columns={tab.columns}
@@ -121,6 +139,16 @@
       data-testid="export"
     >
       <Icon name="export" size={14} /> Export
+    </button>
+    <button
+      onclick={() => (deleting = true)}
+      disabled={!canDelete.ok}
+      title={canDelete.ok
+        ? `Delete the selected rows from ${tab.identity?.schema}.${tab.identity?.table}`
+        : canDelete.reason}
+      data-testid="delete-rows"
+    >
+      <Icon name="trash" size={14} /> Delete rows
     </button>
     <button
       class="ghost"
@@ -183,7 +211,15 @@
       {:else if tab.view === 'plan' && tab.plan}
         <PlanView plan={tab.plan} json={tab.planJson} sql={tab.planSql} />
       {:else if tab.columns.length > 0}
-        <Grid columns={tab.columns} rows={tab.rows} version={tab.rowsVersion} {running} bind:sort={tab.sort} />
+        <Grid
+          bind:this={grid}
+          columns={tab.columns}
+          rows={tab.rows}
+          version={tab.rowsVersion}
+          {running}
+          bind:sort={tab.sort}
+          bind:selectedRows={tab.selectedRows}
+        />
       {:else if tab.message}
         <div class="placeholder">{tab.message}</div>
       {:else if !tab.error}

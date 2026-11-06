@@ -122,6 +122,25 @@ after the last change and on disconnect, in `workspaces.json`, and come back whe
 Results are not saved. A fresh connection with one empty tab saves nothing. At most 50 tabs per server and 50 servers.
 Closing all tabs forgets them.
 
+**Deleting rows from the grid.** Select whole rows (click a row number, Shift to extend) and *Delete rows*
+builds the statement for you. A row is only deletable when it can be traced back to exactly one row of one table:
+the server reports a table OID and an attribute number per result column, so there is no SQL to parse and
+`SELECT id AS whatever` still works — the key is matched by position in the table, not by name. All three rules must
+hold: the columns come from a single ordinary table (not a join, a view, an aggregate or an expression), that table
+has a primary key, and every key column is in the result. The button stays visible and disabled when they do not, with
+the reason in the tooltip, because "nothing happens" is the worst answer. The identity is resolved by one catalog
+query in the background after each run, so it costs nothing until it is needed.
+
+Three things make it safe. The confirmation shows the exact statement, which `plan_delete` and `delete_rows` build the
+same way from the same input, so the preview cannot drift from what runs. Every identifier and value is quoted by the
+server (`quote_ident`, `quote_literal`) in one round trip, never escaped by hand. And the delete runs in a transaction
+that is rolled back unless the affected count is exactly the number of rows selected — so a key that turned out not to
+be unique, or a row somebody else deleted first, changes nothing. If a transaction of the user's is already open a
+savepoint is used instead, leaving their transaction in charge of the outcome. The grid shows a sort as a permutation,
+so the selected *visual* rows are mapped back through it before the key values are read; at most 1,000 rows at a time.
+Not done: editing cells, inserting rows, and `ON DELETE CASCADE` is the server's business, so a delete can still remove
+more rows elsewhere than the one you confirmed.
+
 **Version and title bar.** The sidebar footer reads `Slon <version> · PostgreSQL <server version>`; clicking it copies
 those lines plus the OS and architecture, which is what a bug report needs. The copied text deliberately carries no host,
 user or database name, so it can be pasted into a public issue. The version comes from `tauri.conf.json` through Tauri's

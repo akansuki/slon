@@ -70,6 +70,10 @@ export interface Column {
   name: string;
   typeName: string | null;
   sortKind: SortKind;
+  /** The table this column was read from; null for anything computed. */
+  tableOid: number | null;
+  /** Its position in that table (`attnum`), which survives renaming in the query. */
+  columnId: number | null;
 }
 
 export type RelationKind = 'table' | 'view' | 'materializedView' | 'foreignTable';
@@ -266,4 +270,39 @@ export interface BuildInfo {
   os: string;
   arch: string;
   debug: boolean;
+}
+
+/** A primary-key column of the table a result set can be deleted from. */
+export interface KeyColumn {
+  name: string;
+  /** Quoted by the server. */
+  quoted: string;
+  /** Position in the table; result columns carry the same number. */
+  attnum: number;
+}
+
+export interface RowIdentity {
+  schema: string;
+  table: string;
+  /** Quoted by the server, ready for SQL. */
+  qualified: string;
+  key: KeyColumn[];
+}
+
+export interface DeleteRequest {
+  tableOid: number;
+  /** One entry per row: its key values, in key-column order. */
+  rows: string[][];
+}
+
+export interface DeletePlan {
+  sql: string;
+  rowCount: number;
+  identity: RowIdentity;
+}
+
+export interface DeleteOutcome {
+  sql: string;
+  deleted: number;
+  elapsedMs: number;
 }

@@ -10,6 +10,7 @@ mod explain;
 mod notice;
 mod query;
 mod registry;
+mod rowdelete;
 mod session;
 mod tls;
 
@@ -24,3 +25,6 @@ pub use explain::ExplainResult;
 pub use notice::ServerMessage;
 pub use query::{Column, QueryEvent, QueryOptions, QuerySummary, SortKind};
 pub use registry::{ConnectionInfo, Registry};
+pub use rowdelete::{
+    DeleteOutcome, DeletePlan, DeleteRequest, KeyColumn, RowIdentity, MAX_ROWS as MAX_DELETE_ROWS,
+};

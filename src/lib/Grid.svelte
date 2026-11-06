@@ -17,7 +17,15 @@
     version,
     running,
     sort = $bindable(null),
-  }: { columns: Column[]; rows: Cell[][]; version: number; running: boolean; sort?: SortSpec | null } = $props();
+    selectedRows = $bindable([]),
+  }: {
+    columns: Column[];
+    rows: Cell[][];
+    version: number;
+    running: boolean;
+    sort?: SortSpec | null;
+    selectedRows?: number[];
+  } = $props();
 
   const ROW_H = 26;
   const HEADER_H = 34;
@@ -95,6 +103,27 @@
   });
 
   const range = $derived(sel ? toRange(sel, columns.length) : null);
+
+  // Whole-row selection, mapped through the sort to indexes into `rows`. The grid shows a
+  // permutation, so the visual position is not the data position.
+  const selectedDataRows = $derived.by(() => {
+    void version;
+    if (!sel?.rows || !range) return [];
+    const out: number[] = [];
+    for (let i = range.r0; i <= range.r1; i++) {
+      const d = order ? order[i] : i;
+      if (d !== undefined && d < rows.length) out.push(d);
+    }
+    return out;
+  });
+  $effect(() => {
+    selectedRows = selectedDataRows;
+  });
+
+  /** Called by the pane after rows are deleted: the old positions mean nothing now. */
+  export function clearSelection() {
+    sel = null;
+  }
 
   function ariaSort(i: number) {
     return sort?.col === i ? (sort.dir === 'asc' ? 'ascending' : 'descending') : 'none';
