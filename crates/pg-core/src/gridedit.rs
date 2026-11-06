@@ -12,16 +12,22 @@
 //! Every identifier and every value in the generated statement is quoted by the server
 //! (`quote_ident`, `quote_nullable`), never by hand. The statement shown in the confirmation
 //! is the statement that runs: `plan_delete` and `run_delete` build it the same way from
-//! the same input, so the preview cannot drift from what is executed.
+//! the same input, so the preview cannot drift from what is executed. The transaction
+//! commands around it are plumbing and are not part of what is shown.
 //!
 //! An edit also carries the value the grid was showing into the WHERE clause, so a row that
 //! somebody else changed in the meantime is reported instead of being overwritten.
+//!
+//! Latency matters here: a cell edit happens while the person waits, and on a remote server
+//! every round trip is felt. So the catalog lookup, the value quoting and the transaction
+//! probe are pipelined into one round trip, the statement carries its own `BEGIN`, and the
+//! whole write costs three round trips rather than five.
 
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use tokio_postgres::error::SqlState;
-use tokio_postgres::SimpleQueryMessage;
+use tokio_postgres::{SimpleQueryMessage, SimpleQueryRow};
 
 use crate::error::{ErrorKind, PgError};
 use crate::session::Session;
@@ -29,6 +35,16 @@ use crate::session::Session;
 /// More rows than this in one go is almost certainly a mistake, and the statement would be
 /// unreadable in the confirmation anyway.
 pub const MAX_ROWS: usize = 1000;
+
+const DELETE_SAVEPOINT: &str = "slon_delete";
+const UPDATE_SAVEPOINT: &str = "slon_update";
+
+const FINISH_FAILED: &str = "The statement ran, but Slon could not close the transaction, \
+                             so the change may not have been saved. Run the query again to \
+                             see what the table holds.";
+const ROLLBACK_FAILED: &str = "Slon could not undo that, so this connection is still inside \
+                               a transaction that has to be ended by hand. Run ROLLBACK \
+                               before using this tab again.";
 
 /// The table a result set can be deleted from, and the key that identifies a row in it.
 #[derive(Debug, Clone, Serialize)]
@@ -93,6 +109,32 @@ pub struct DeleteOutcome {
     pub elapsed_ms: u64,
 }
 
+/// One cell: which row, which column, the new value, and the value the grid was showing.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateRequest {
+    pub table_oid: u32,
+    /// Position in the table of the column being written.
+    pub column: i16,
+    /// `None` sets the cell to NULL.
+    pub value: Option<String>,
+    /// What the grid was showing, used to detect a row somebody else changed meanwhile.
+    pub old_value: Option<String>,
+    /// The row's key values, in key order.
+    pub key: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateOutcome {
+    pub sql: String,
+    /// What the column holds now, read back from the server: writing `1.5` into a
+    /// `numeric(10,2)` stores `1.50`, and the grid should show that rather than the text
+    /// that was typed.
+    pub stored: Option<String>,
+    pub elapsed_ms: u64,
+}
+
 fn query_err(e: &tokio_postgres::Error) -> PgError {
     PgError::from_driver(e, ErrorKind::Query)
 }
@@ -101,9 +143,25 @@ fn refuse(msg: impl Into<String>) -> PgError {
     PgError::new(ErrorKind::Query, msg)
 }
 
+/// Add a sentence about the connection's state without losing what the server said.
+fn with_hint(mut err: PgError, note: &str) -> PgError {
+    err.hint = Some(match err.hint {
+        Some(h) => format!("{h}\n{note}"),
+        None => note.to_string(),
+    });
+    err
+}
+
+// ---------------------------------------------------------------------------- catalog
+
 /// Look up the table behind a result column's table OID, and its primary key.
 pub async fn row_identity(session: &Session, table_oid: u32) -> Result<RowIdentity, PgError> {
-    session.check_open()?;
+    let _guard = session.begin_query()?;
+    identity_of(session, table_oid).await
+}
+
+/// The catalog query itself, without the busy guard: the callers below already hold it.
+async fn identity_of(session: &Session, table_oid: u32) -> Result<RowIdentity, PgError> {
     // The OID came from the server in a RowDescription, so it is a plain number and safe to
     // write into the statement.
     let sql = format!(
@@ -232,8 +290,174 @@ async fn quote_values(
     Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
 }
 
-/// Build the statement. Shared by the preview and the real thing so they cannot differ.
-pub async fn plan_delete(session: &Session, req: &DeleteRequest) -> Result<DeletePlan, PgError> {
+// ------------------------------------------------------------------------ transactions
+
+/// Find out whether the person already has a transaction of their own open.
+///
+/// A savepoint is only legal inside a transaction block — outside one the server answers
+/// 25P01 and nothing happens — so the attempt both asks the question and, when the answer is
+/// yes, leaves behind exactly the savepoint the statement will need. Whoever asks for the
+/// probe owns the savepoint from then on: see [`discard_savepoint`].
+async fn probe_savepoint(session: &Session, name: &str) -> Result<bool, PgError> {
+    match session
+        .client
+        .simple_query(&format!("SAVEPOINT {name}"))
+        .await
+    {
+        Ok(_) => Ok(true),
+        Err(e) if e.code() == Some(&SqlState::NO_ACTIVE_SQL_TRANSACTION) => Ok(false),
+        Err(e) => Err(query_err(&e)),
+    }
+}
+
+/// Give back the probe's savepoint when the request turns out to be one we will not run.
+///
+/// Rolling back first, rather than only releasing, matters: the pipelined catalog read ran
+/// inside the person's transaction, and if *it* was what failed, their transaction is now
+/// aborted. Rolling back to the savepoint hands it back to them in working order.
+async fn discard_savepoint(
+    session: &Session,
+    name: &str,
+    in_user_txn: bool,
+    err: PgError,
+) -> PgError {
+    if !in_user_txn {
+        return err;
+    }
+    let sql = format!("ROLLBACK TO SAVEPOINT {name}; RELEASE SAVEPOINT {name}");
+    match session.client.simple_query(&sql).await {
+        Ok(_) => err,
+        Err(_) => with_hint(err, ROLLBACK_FAILED),
+    }
+}
+
+/// Run one statement so that it either takes effect completely or not at all.
+///
+/// When the person has a transaction open, the statement runs inside it behind the savepoint
+/// the probe left: a bad value (a letter typed into an `int4`, say) rolls back to that
+/// savepoint instead of aborting everything they had already done. When they do not, `BEGIN`
+/// travels with the statement in a single simple-query batch, which leaves the transaction
+/// open for the commit below and costs no extra round trip.
+///
+/// `accept` decides whether to keep the work. Undoing it is not best-effort: when the
+/// statement failed *and* the undo failed, both are reported, because the connection is then
+/// sitting in a transaction nobody has ended.
+async fn run_guarded(
+    session: &Session,
+    savepoint: &str,
+    in_user_txn: bool,
+    sql: &str,
+    accept: impl Fn(&[SimpleQueryMessage]) -> bool,
+) -> Result<Vec<SimpleQueryMessage>, PgError> {
+    let client = &session.client;
+    let batch = if in_user_txn {
+        sql.to_string()
+    } else {
+        format!("BEGIN;\n{sql}")
+    };
+
+    let result = client.simple_query(&batch).await.map_err(|e| query_err(&e));
+    let keep = result.as_ref().map(|m| accept(m)).unwrap_or(false);
+    let finish = match (keep, in_user_txn) {
+        (true, true) => format!("RELEASE SAVEPOINT {savepoint}"),
+        (true, false) => "COMMIT".to_string(),
+        (false, true) => {
+            format!("ROLLBACK TO SAVEPOINT {savepoint}; RELEASE SAVEPOINT {savepoint}")
+        }
+        (false, false) => "ROLLBACK".to_string(),
+    };
+    let cleanup = client
+        .simple_query(&finish)
+        .await
+        .map_err(|e| query_err(&e));
+
+    match (result, cleanup) {
+        (Ok(msgs), Ok(_)) => Ok(msgs),
+        (Ok(_), Err(c)) => Err(with_hint(c, FINISH_FAILED)),
+        (Err(e), Ok(_)) => Err(e),
+        (Err(e), Err(_)) => Err(with_hint(e, ROLLBACK_FAILED)),
+    }
+}
+
+/// What a grid write needs to know before it can run, fetched in a single round trip.
+///
+/// The catalog lookup, the value quoting and the savepoint probe do not depend on one
+/// another, so they are polled together and tokio-postgres pipelines them onto the
+/// connection. `join!` and not `try_join!` on purpose: the probe's answer has to be read even
+/// when one of the others failed, or its savepoint would be left behind.
+struct Preamble {
+    identity: Result<RowIdentity, PgError>,
+    quoted: Result<Vec<String>, PgError>,
+    /// Whether a transaction of the person's own is open. `Ok(false)` when no probe was asked
+    /// for, which is the case for a preview that will not write anything.
+    in_user_txn: Result<bool, PgError>,
+}
+
+async fn preamble(
+    session: &Session,
+    table_oid: u32,
+    values: &[Option<String>],
+    savepoint: Option<&str>,
+) -> Preamble {
+    let (identity, quoted, in_user_txn) = tokio::join!(
+        identity_of(session, table_oid),
+        quote_values(session, values),
+        async {
+            match savepoint {
+                Some(name) => probe_savepoint(session, name).await,
+                None => Ok(false),
+            }
+        },
+    );
+    Preamble {
+        identity,
+        quoted,
+        in_user_txn,
+    }
+}
+
+/// Pick up the preamble: the plan when everything worked, and otherwise the error that best
+/// explains the refusal, with the probe's savepoint handed back.
+async fn settle<T>(
+    session: &Session,
+    savepoint: &str,
+    built: Result<T, PgError>,
+    in_user_txn: Result<bool, PgError>,
+) -> Result<(T, bool), PgError> {
+    match (built, in_user_txn) {
+        (Ok(plan), Ok(txn)) => Ok((plan, txn)),
+        (Err(e), Ok(txn)) => Err(discard_savepoint(session, savepoint, txn, e).await),
+        // The request itself was bad, which says more than a failed probe does.
+        (Err(e), Err(_)) => Err(e),
+        (Ok(_), Err(e)) => Err(e),
+    }
+}
+
+/// The row count of the last statement in a batch. `BEGIN` reports one of its own, so the
+/// last is the one that matters.
+fn affected(msgs: &[SimpleQueryMessage]) -> u64 {
+    msgs.iter()
+        .rev()
+        .find_map(|m| match m {
+            SimpleQueryMessage::CommandComplete(n) => Some(*n),
+            _ => None,
+        })
+        .unwrap_or(0)
+}
+
+fn returned(msgs: &[SimpleQueryMessage]) -> Vec<&SimpleQueryRow> {
+    msgs.iter()
+        .filter_map(|m| match m {
+            SimpleQueryMessage::Row(r) => Some(r),
+            _ => None,
+        })
+        .collect()
+}
+
+// ----------------------------------------------------------------------------- deleting
+
+/// Check the selection and flatten it into the values the server has to quote.
+fn delete_values(req: &DeleteRequest) -> Result<Vec<Option<String>>, PgError> {
     if req.rows.is_empty() {
         return Err(refuse("No rows are selected."));
     }
@@ -243,14 +467,21 @@ pub async fn plan_delete(session: &Session, req: &DeleteRequest) -> Result<Delet
             req.rows.len()
         )));
     }
-    let identity = row_identity(session, req.table_oid).await?;
+    Ok(req.rows.iter().flatten().cloned().map(Some).collect())
+}
+
+/// Build the statement. Shared by the preview and the real thing so they cannot differ.
+fn delete_plan(
+    identity: Result<RowIdentity, PgError>,
+    quoted: Result<Vec<String>, PgError>,
+    req: &DeleteRequest,
+) -> Result<DeletePlan, PgError> {
+    let identity = identity?;
+    let quoted = quoted?;
     let width = identity.key.len();
     if req.rows.iter().any(|r| r.len() != width) {
         return Err(refuse("The key values do not match the primary key."));
     }
-
-    let flat: Vec<Option<String>> = req.rows.iter().flatten().cloned().map(Some).collect();
-    let quoted = quote_values(session, &flat).await?;
 
     let predicate = if width == 1 {
         let list = quoted.join(", ");
@@ -278,45 +509,34 @@ pub async fn plan_delete(session: &Session, req: &DeleteRequest) -> Result<Delet
     })
 }
 
+/// The statement the confirmation dialog shows, without running anything.
+pub async fn plan_delete(session: &Session, req: &DeleteRequest) -> Result<DeletePlan, PgError> {
+    let _guard = session.begin_query()?;
+    let values = delete_values(req)?;
+    let p = preamble(session, req.table_oid, &values, None).await;
+    delete_plan(p.identity, p.quoted, req)
+}
+
 /// Run the statement, and only keep it if it touched exactly the selected rows.
 ///
 /// The count check is what protects against a surprise: if the key turned out not to be
 /// unique, or somebody else deleted the row first, the whole thing is rolled back and
 /// nothing changes.
 pub async fn run_delete(session: &Session, req: &DeleteRequest) -> Result<DeleteOutcome, PgError> {
-    let plan = plan_delete(session, req).await?;
     let _guard = session.begin_query()?;
-    let started = Instant::now();
-    let client = &session.client;
+    let values = delete_values(req)?;
+    let p = preamble(session, req.table_oid, &values, Some(DELETE_SAVEPOINT)).await;
+    let built = delete_plan(p.identity, p.quoted, req);
+    let (plan, in_user_txn) = settle(session, DELETE_SAVEPOINT, built, p.in_user_txn).await?;
 
-    // A savepoint only works inside a transaction block (25P01 otherwise): that tells us
-    // whether the user has a transaction of their own open, without disturbing it.
-    let in_user_txn = match client.simple_query("SAVEPOINT slon_delete").await {
-        Ok(_) => true,
-        Err(e) if e.code() == Some(&SqlState::NO_ACTIVE_SQL_TRANSACTION) => {
-            client
-                .simple_query("BEGIN")
-                .await
-                .map_err(|e| query_err(&e))?;
-            false
-        }
-        Err(e) => return Err(query_err(&e)),
-    };
-
-    let result = client.execute(plan.sql.as_str(), &[]).await;
     let expected = plan.row_count as u64;
-    let keep = matches!(&result, Ok(n) if *n == expected);
+    let started = Instant::now();
+    let msgs = run_guarded(session, DELETE_SAVEPOINT, in_user_txn, &plan.sql, |m| {
+        affected(m) == expected
+    })
+    .await?;
 
-    let finish = match (keep, in_user_txn) {
-        (true, true) => "RELEASE SAVEPOINT slon_delete",
-        (true, false) => "COMMIT",
-        (false, true) => "ROLLBACK TO SAVEPOINT slon_delete; RELEASE SAVEPOINT slon_delete",
-        (false, false) => "ROLLBACK",
-    };
-    let finished = client.simple_query(finish).await;
-
-    let deleted = result.map_err(|e| query_err(&e))?;
-    finished.map_err(|e| query_err(&e))?;
+    let deleted = affected(&msgs);
     if deleted != expected {
         return Err(refuse(format!(
             "Expected to delete {expected} row{}, but the statement matched {deleted}. \
@@ -332,39 +552,28 @@ pub async fn run_delete(session: &Session, req: &DeleteRequest) -> Result<Delete
     })
 }
 
-/// One cell: which row, which column, the new value, and the value the grid was showing.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UpdateRequest {
-    pub table_oid: u32,
-    /// Position in the table of the column being written.
-    pub column: i16,
-    /// `None` sets the cell to NULL.
-    pub value: Option<String>,
-    /// What the grid was showing, used to detect a row somebody else changed meanwhile.
-    pub old_value: Option<String>,
-    /// The row's key values, in key order.
-    pub key: Vec<String>,
+// ------------------------------------------------------------------------------ editing
+
+/// The column rendered exactly as the grid received it.
+///
+/// Not `::text`: casting `character(n)` to text drops the trailing padding the wire form
+/// carries, so the guard below could never match and every edit of a `char` column was
+/// refused as a conflict. `format('%s', …)` runs the type's own output function, which is
+/// what the result rows were built with, and it needs no equality operator — so `json`,
+/// `xml` and `point` work too. It renders NULL as an empty string, so NULL is kept apart.
+fn wire_text(quoted: &str) -> String {
+    format!("CASE WHEN {quoted} IS NULL THEN NULL ELSE format('%s', {quoted}) END")
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UpdateOutcome {
-    pub sql: String,
-    /// What the column holds now, read back from the server: writing `1.5` into a
-    /// `numeric(10,2)` stores `1.50`, and the grid should show that rather than the text
-    /// that was typed.
-    pub stored: Option<String>,
-    pub elapsed_ms: u64,
-}
-
-/// Build the UPDATE for one cell. Separate from running it so a test, and a future
-/// preview, see exactly the statement that would be sent.
-async fn plan_update(
-    session: &Session,
+/// Build the UPDATE for one cell. Separate from running it so a test, and a future preview,
+/// see exactly the statement that would be sent.
+fn update_sql(
+    identity: Result<RowIdentity, PgError>,
+    quoted: Result<Vec<String>, PgError>,
     req: &UpdateRequest,
-) -> Result<(String, RowIdentity), PgError> {
-    let identity = row_identity(session, req.table_oid).await?;
+) -> Result<String, PgError> {
+    let identity = identity?;
+    let quoted = quoted?;
     if req.key.len() != identity.key.len() {
         return Err(refuse("The key values do not match the primary key."));
     }
@@ -377,36 +586,35 @@ async fn plan_update(
         return Err(refuse(format!("{} is {reason}.", column.name)));
     }
 
-    // One round trip quotes the new value, the old one and every key value.
-    let mut values: Vec<Option<String>> = vec![req.value.clone(), req.old_value.clone()];
-    values.extend(req.key.iter().cloned().map(Some));
-    let q = quote_values(session, &values).await?;
-    let (new_value, old_value, keys) = (&q[0], &q[1], &q[2..]);
-
+    // The order `update_values` put them in: the new value, the old one, then the key.
+    let (new_value, old_value, keys) = (&quoted[0], &quoted[1], &quoted[2..]);
     let mut wheres: Vec<String> = identity
         .key
         .iter()
         .zip(keys)
         .map(|(k, v)| format!("{} = {v}", k.quoted))
         .collect();
-    // The guard that turns a silent overwrite into a reported conflict. Compared as text
-    // because that is exactly what the grid showed, and because some types (json, xml)
-    // have no equality operator of their own. IS NOT DISTINCT FROM so NULL matches NULL.
+    // The guard that turns a silent overwrite into a reported conflict: compared against
+    // the exact text the grid was showing. IS NOT DISTINCT FROM so NULL matches NULL.
     wheres.push(format!(
-        "{}::text IS NOT DISTINCT FROM {old_value}",
-        column.quoted
+        "{} IS NOT DISTINCT FROM {old_value}",
+        wire_text(&column.quoted)
     ));
 
-    Ok((
-        format!(
-            "UPDATE {}\n   SET {} = {new_value}\n WHERE {}\nRETURNING {}::text",
-            identity.qualified,
-            column.quoted,
-            wheres.join("\n   AND "),
-            column.quoted
-        ),
-        identity,
+    Ok(format!(
+        "UPDATE {}\n   SET {} = {new_value}\n WHERE {}\nRETURNING {}",
+        identity.qualified,
+        column.quoted,
+        wheres.join("\n   AND "),
+        wire_text(&column.quoted)
     ))
+}
+
+/// Everything the UPDATE needs quoted, in the order `update_sql` reads it back.
+fn update_values(req: &UpdateRequest) -> Vec<Option<String>> {
+    let mut values = vec![req.value.clone(), req.old_value.clone()];
+    values.extend(req.key.iter().cloned().map(Some));
+    values
 }
 
 /// Write one cell, and give back what the column holds afterwards.
@@ -414,39 +622,23 @@ async fn plan_update(
 /// Exactly one row must match: zero means the row changed or went away since the query
 /// ran, and in that case nothing is written and the grid keeps showing the old value.
 pub async fn run_update(session: &Session, req: &UpdateRequest) -> Result<UpdateOutcome, PgError> {
-    let (sql, _) = plan_update(session, req).await?;
     let _guard = session.begin_query()?;
+    let values = update_values(req);
+    let p = preamble(session, req.table_oid, &values, Some(UPDATE_SAVEPOINT)).await;
+    let built = update_sql(p.identity, p.quoted, req);
+    let (sql, in_user_txn) = settle(session, UPDATE_SAVEPOINT, built, p.in_user_txn).await?;
+
     let started = Instant::now();
-    let client = &session.client;
+    let msgs = run_guarded(session, UPDATE_SAVEPOINT, in_user_txn, &sql, |m| {
+        returned(m).len() == 1
+    })
+    .await?;
 
-    let in_user_txn = match client.simple_query("SAVEPOINT slon_update").await {
-        Ok(_) => true,
-        Err(e) if e.code() == Some(&SqlState::NO_ACTIVE_SQL_TRANSACTION) => {
-            client
-                .simple_query("BEGIN")
-                .await
-                .map_err(|e| query_err(&e))?;
-            false
-        }
-        Err(e) => return Err(query_err(&e)),
-    };
-
-    let result = client.query(sql.as_str(), &[]).await;
-    let keep = matches!(&result, Ok(rows) if rows.len() == 1);
-    let finish = match (keep, in_user_txn) {
-        (true, true) => "RELEASE SAVEPOINT slon_update",
-        (true, false) => "COMMIT",
-        (false, true) => "ROLLBACK TO SAVEPOINT slon_update; RELEASE SAVEPOINT slon_update",
-        (false, false) => "ROLLBACK",
-    };
-    let finished = client.simple_query(finish).await;
-
-    let rows = result.map_err(|e| query_err(&e))?;
-    finished.map_err(|e| query_err(&e))?;
+    let rows = returned(&msgs);
     match rows.len() {
         1 => Ok(UpdateOutcome {
+            stored: rows[0].get(0).map(str::to_owned),
             sql,
-            stored: rows[0].get::<_, Option<String>>(0),
             elapsed_ms: started.elapsed().as_millis() as u64,
         }),
         0 => Err(refuse(

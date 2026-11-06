@@ -1735,7 +1735,8 @@ async fn a_cell_edit_writes_one_value_and_reads_back_what_was_stored() {
         out.sql
     );
     assert!(
-        out.sql.contains("label::text IS NOT DISTINCT FROM 'one'"),
+        out.sql
+            .contains("format('%s', label) END IS NOT DISTINCT FROM 'one'"),
         "{}",
         out.sql
     );
@@ -1921,6 +1922,131 @@ async fn columns_the_server_will_not_accept_are_reported_as_such() {
     assert!(err.message.contains("generated column"), "{}", err.message);
 }
 
+/// A refused edit must never cost the person the transaction they opened themselves.
+///
+/// Both ways of being refused are covered: a value the server rejects (a letter in an `int4`,
+/// which is what someone actually hit), and a request Slon refuses before sending anything.
+/// Either one would abort the whole transaction without the savepoint the probe leaves
+/// behind, losing work the person had already done in it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_edit_leaves_the_users_transaction_usable() {
+    let cfg = cfg_or_skip!();
+    let reg = Registry::new();
+    let t = tab(&reg, &cfg).await;
+    run(
+        &reg,
+        t,
+        "DROP SCHEMA IF EXISTS slon_up_txn CASCADE;
+         CREATE SCHEMA slon_up_txn;
+         CREATE TABLE slon_up_txn.t (id int PRIMARY KEY, n int);
+         INSERT INTO slon_up_txn.t VALUES (1, 10), (2, 20);",
+        &QueryOptions::default(),
+    )
+    .await
+    .0
+    .unwrap();
+    let (_, c) = run(
+        &reg,
+        t,
+        "SELECT * FROM slon_up_txn.t",
+        &QueryOptions::default(),
+    )
+    .await;
+    let oid = table_oid_of(&c.columns[0]).unwrap();
+
+    run(&reg, t, "BEGIN", &QueryOptions::default())
+        .await
+        .0
+        .unwrap();
+    run(
+        &reg,
+        t,
+        "INSERT INTO slon_up_txn.t VALUES (99, 990)",
+        &QueryOptions::default(),
+    )
+    .await
+    .0
+    .unwrap();
+
+    // Refused by the server: 'x' is not an int4.
+    let err = reg
+        .update_cell(
+            t,
+            &UpdateRequest {
+                table_oid: oid,
+                column: 2,
+                value: Some("x".into()),
+                old_value: Some("10".into()),
+                key: vec!["1".into()],
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.message.contains("invalid input syntax"),
+        "{}",
+        err.message
+    );
+
+    // An aborted transaction would fail this with 25P02, and the insert would be gone.
+    let (ok, c) = run(
+        &reg,
+        t,
+        "SELECT count(*) FROM slon_up_txn.t",
+        &QueryOptions::default(),
+    )
+    .await;
+    ok.unwrap();
+    assert_eq!(c.rows[0][0][0], s("3"));
+
+    // Refused by Slon, before anything was sent: the savepoint still has to be given back.
+    let err = reg
+        .update_cell(
+            t,
+            &UpdateRequest {
+                table_oid: oid,
+                column: 2,
+                value: Some("11".into()),
+                old_value: Some("10".into()),
+                key: vec!["1".into(), "spare".into()],
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(err.message.contains("primary key"), "{}", err.message);
+
+    let out = reg
+        .update_cell(
+            t,
+            &UpdateRequest {
+                table_oid: oid,
+                column: 2,
+                value: Some("11".into()),
+                old_value: Some("10".into()),
+                key: vec!["1".into()],
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.stored.as_deref(), Some("11"));
+
+    // The edit joined the person's transaction rather than committing behind their back,
+    // so their rollback takes it with them.
+    run(&reg, t, "ROLLBACK", &QueryOptions::default())
+        .await
+        .0
+        .unwrap();
+    let (_, c) = run(
+        &reg,
+        t,
+        "SELECT n FROM slon_up_txn.t ORDER BY id",
+        &QueryOptions::default(),
+    )
+    .await;
+    assert_eq!(c.rows[0].len(), 2);
+    assert_eq!(c.rows[0][0][0], s("10"));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn an_edited_value_cannot_become_sql() {
     let cfg = cfg_or_skip!();
@@ -1972,4 +2098,107 @@ async fn an_edited_value_cannot_become_sql() {
     )
     .await;
     assert_eq!(c.rows[0][0][0], s(nasty));
+}
+
+/// The value the grid holds must be the value the conflict guard matches, for every type.
+///
+/// This is the test that was missing when `::text` was used to render the guard: it looked
+/// right for int, text and numeric, and silently refused every edit of a `char(n)` column,
+/// whose wire form carries padding that a text cast removes.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_column_type_round_trips_through_an_edit() {
+    let cfg = cfg_or_skip!();
+    let reg = Registry::new();
+    let t = tab(&reg, &cfg).await;
+    run(
+        &reg,
+        t,
+        "DROP SCHEMA IF EXISTS slon_types CASCADE;
+         CREATE SCHEMA slon_types;
+         CREATE TABLE slon_types.t (
+           id          int PRIMARY KEY,
+           padded      char(10),
+           words       text,
+           money       numeric(10,2),
+           approx      float8,
+           raw         bytea,
+           at          timestamptz,
+           doc         json,          -- no equality operator
+           docb        jsonb,
+           place       point,         -- no equality operator
+           tags        int[],
+           flag        bool,
+           ident       uuid,
+           nothing     text           -- stays NULL
+         );
+         INSERT INTO slon_types.t VALUES (
+           1, 'ab', 'hello', 12.30, 0.1, '\\x4142', '2026-03-04 05:06:07+00',
+           '{\"a\": 1}', '{\"a\": 1}', '(1,2)', '{1,2,3}', true,
+           '0b7cf0cc-9b2a-4f4e-8f3d-2a1b3c4d5e6f', NULL);",
+        &QueryOptions::default(),
+    )
+    .await
+    .0
+    .unwrap();
+
+    let (_, c) = run(
+        &reg,
+        t,
+        "SELECT * FROM slon_types.t",
+        &QueryOptions::default(),
+    )
+    .await;
+    let columns = &c.columns[0];
+    let row = &c.rows[0][0];
+    let oid = table_oid_of(columns).unwrap();
+    let key = vec![row[0].clone().expect("the key is never NULL")];
+
+    // Writing each value back as itself must match the guard and return the same text: if
+    // the grid can show it, the grid must be able to edit it.
+    for (i, col) in columns.iter().enumerate() {
+        let attnum = col.column_id.unwrap();
+        if attnum == 1 {
+            continue; // the key
+        }
+        let shown = row[i].clone();
+        let out = reg
+            .update_cell(
+                t,
+                &UpdateRequest {
+                    table_oid: oid,
+                    column: attnum,
+                    value: shown.clone(),
+                    old_value: shown.clone(),
+                    key: key.clone(),
+                },
+            )
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "editing {} ({:?}) failed: {}",
+                    col.name, col.type_name, e.message
+                )
+            });
+        assert_eq!(
+            out.stored, shown,
+            "{} ({:?}) did not come back as it went in",
+            col.name, col.type_name
+        );
+    }
+
+    // And a stale value is still refused, for a type whose text form needed the fix.
+    let err = reg
+        .update_cell(
+            t,
+            &UpdateRequest {
+                table_oid: oid,
+                column: 2,
+                value: Some("zz".into()),
+                old_value: Some("not what is there".into()),
+                key: key.clone(),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(err.message.contains("changed since"), "{}", err.message);
 }

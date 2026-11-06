@@ -31,7 +31,7 @@ export (CSV/TSV/JSON/JSONL), deleting selected rows and editing cells in the gri
 query history (Ctrl+H), remembered tabs per server, version in the sidebar footer
 (click to copy bug-report details) and the connection in the title bar.
 
-Verified on Linux (PostgreSQL 16): 7 pg-core unit + 35 integration tests, 22 pg-profiles store tests + 12 history/workspace
+Verified on Linux (PostgreSQL 16): 7 pg-core unit + 37 integration tests, 22 pg-profiles store tests + 12 history/workspace
 tests (+1 ignored real credential store), 2 src-tauri tests, 112 UI unit tests, svelte-check clean, 176/176 end-to-end checks.
 Not verified: Excel opening the exported CSV, Windows certificate store as trust source, real RDS / company CA, plans from other
 server versions (parser written against PG 16 JSON; PG 18 adds fields it ignores).
@@ -82,6 +82,12 @@ Windows (without xvfb) for the rendering users actually see.
   JSON numbers keep server digits. The page may only write to a path the Rust-side save dialog returned.
 - History/tabs: plain-text JSON files in the config folder, atomic writes; a damaged file is moved to `*.bad`. Password check on
   statements is best effort. Results are not persisted.
+- Grid writes: catalog lookup, value quoting and the `SAVEPOINT` transaction probe are pipelined into one round trip
+  (`join!`, not `try_join!` — the probe's answer must be read even when another leg failed, or its savepoint is
+  orphaned); `BEGIN` rides with the statement. Three round trips per write. A refused edit rolls back to the probe's
+  savepoint, so it never costs the person an open transaction of their own; a failed rollback is reported alongside the
+  original error rather than swallowed. The busy guard is taken at the entry point (`row_identity`, `plan_delete`,
+  `delete_rows`, `update_cell`), so a grid write cannot interleave with a statement running in the same tab.
 
 ## Next
 Inserting rows in the grid, copy as INSERT/JSON, export of all rows of a large result (needs a re-run), client certificates, import/export of saved

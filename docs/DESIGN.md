@@ -133,7 +133,7 @@ query in the background after each run, so it costs nothing until it is needed.
 
 Three things make it safe. The confirmation shows the exact statement, which `plan_delete` and `delete_rows` build the
 same way from the same input, so the preview cannot drift from what runs. Every identifier and value is quoted by the
-server (`quote_ident`, `quote_literal`) in one round trip, never escaped by hand. And the delete runs in a transaction
+server (`quote_ident`, `quote_nullable`) in one round trip, never escaped by hand. And the delete runs in a transaction
 that is rolled back unless the affected count is exactly the number of rows selected — so a key that turned out not to
 be unique, or a row somebody else deleted first, changes nothing. If a transaction of the user's is already open a
 savepoint is used instead, leaving their transaction in charge of the outcome. The grid shows a sort as a permutation,
@@ -152,12 +152,39 @@ which columns are writable is visible without hovering each one.
 
 The value the grid holds is the server's own text for that value, so an edit is text out and text back in through the
 type's input function and nothing has to be parsed on the way. The UPDATE returns the column, so the grid shows what
-was *stored* rather than what was typed: `1.5` into a `numeric(10,2)` comes back as `1.50`. Each edit also carries the
-old value into the WHERE clause as `col::text IS NOT DISTINCT FROM <old>` — compared as text because that is exactly
-what was on screen, and because `json` and `xml` have no equality operator; `IS NOT DISTINCT FROM` so a NULL old value
-matches. Zero rows affected then means somebody else changed the row, and the edit is rolled back and reported instead
+was *stored* rather than what was typed: `1.5` into a `numeric(10,2)` comes back as `1.50`. The value in the guard and in the returned row is rendered with `format('%s', col)`, not `col::text`: casting
+`character(n)` to text drops the trailing padding the wire form carries, so a text-cast guard could never match and
+every edit of a `char` column was refused as a conflict. `format` runs the type's own output function — the one the
+result rows were built with — and needs no equality operator, so `json`, `xml` and `point` work too; it renders NULL
+as an empty string, so NULL is kept apart with an explicit CASE.
+
+Each edit also carries the old value into the WHERE clause, `IS NOT DISTINCT FROM` so a NULL old value matches. Zero
+rows affected then means somebody else changed the row, and the edit is rolled back and reported instead
 of overwriting them. A successful write says so over the grid: "Saved label in 4 ms", or "Saved price as 1.50" when the server stored
 something other than what was typed — without that line the value visibly changing looks like the edit went wrong.
+
+**Round trips, and whose transaction it is.** An edit happens while someone waits, so on a remote server every round
+trip is felt. The catalog lookup, the value quoting and the transaction probe need nothing from each other, so they are
+polled together with `join!` and tokio-postgres pipelines them onto the connection as one round trip; `BEGIN` then
+travels with the statement in a single simple-query batch. Three round trips per write instead of six.
+
+Whether the person already has a transaction open decides how the write is wrapped, and the probe that answers it is
+`SAVEPOINT`: outside a transaction block the server answers 25P01 and nothing happens, so one attempt both asks the
+question and, when the answer is yes, leaves behind exactly the savepoint the statement needs. That savepoint is what
+keeps a refused edit from costing them work: a letter typed into an `int4` would otherwise abort their whole
+transaction, and instead it rolls back to the savepoint. The probe runs before the request has been checked, so a
+request Slon refuses hands the savepoint back by rolling back to it — which also rescues their transaction if it was
+Slon's own catalog read that failed inside it. Undoing is not best-effort: when the statement failed *and* the undo
+failed, both are reported, because the connection is then sitting in a transaction nobody has ended and the person
+has to run `ROLLBACK` before the tab is usable again.
+
+`join!` rather than `try_join!`, deliberately: `try_join!` abandons the other futures on the first error, and the
+probe's answer has to be read even when the catalog lookup failed, or its savepoint would be left behind.
+
+`row_identity`, `plan_delete`, `delete_rows` and `update_cell` all take the tab's busy guard before their first query
+and hold it to the end, so a grid write cannot interleave with a statement running in the same tab — one connection per
+tab means interleaving would mean queueing behind a result stream, or landing in the middle of someone's transaction.
+The guard is taken once, at the entry point, and the inner helpers run without it.
 
 A value the column will not take (a letter in an `int4`, a constraint, a conflict) leaves the editor open holding what
 was typed, outlined in red, with the server's own message over the grid for eight seconds; Escape then abandons it and

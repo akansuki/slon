@@ -19,6 +19,7 @@
     running,
     sort = $bindable(null),
     selectedRows = $bindable([]),
+    editMode = false,
     editable = [],
     onedit,
   }: {
@@ -28,7 +29,13 @@
     running: boolean;
     sort?: SortSpec | null;
     selectedRows?: number[];
-    /** Per column: whether a cell can be written. Empty means the result is read-only. */
+    /**
+     * Whether the person has switched editing on. Kept separate from `editable` on purpose:
+     * a result can be perfectly editable while edit mode is off, and the grid must not have
+     * to guess which it is from an empty array.
+     */
+    editMode?: boolean;
+    /** Per column: whether a cell can be written, and why not. */
     editable?: { ok: boolean; reason: string }[];
     /**
      * Writes one cell. What it resolves to is shown over the grid; rejecting it keeps the
@@ -144,7 +151,10 @@
     /** Set when the server refused the value: the editor stays open to be corrected. */
     failed: boolean;
   } | null>(null);
-  const canEdit = (ci: number) => Boolean(onedit) && (editable[ci]?.ok ?? false);
+  const canEdit = (ci: number) =>
+    editMode && Boolean(onedit) && (editable[ci]?.ok ?? false);
+  /** A cell that edit mode covers but this column refuses: dimmed, with the reason. */
+  const locked = (ci: number) => editMode && Boolean(onedit) && !canEdit(ci);
 
   function startEdit(r: number, ci: number) {
     if (!canEdit(ci) || edit?.saving) return;
@@ -492,9 +502,9 @@
                 class:sel={range && inRange(range, i, ci)}
                 class:focus={sel && sel.focus.r === i && sel.focus.c === ci && !sel.rows}
                 class:editable={canEdit(ci)}
-                class:readonly={editable.length > 0 && !canEdit(ci)}
+                class:readonly={locked(ci)}
                 style:width="{widths[ci]}px"
-                title={editable.length > 0 && !canEdit(ci)
+                title={locked(ci)
                   ? editable[ci]?.reason
                   : v === null
                     ? 'NULL'

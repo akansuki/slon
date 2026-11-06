@@ -240,7 +240,8 @@
           {running}
           bind:sort={tab.sort}
           bind:selectedRows={tab.selectedRows}
-          editable={tab.editMode ? tab.editable : []}
+          editMode={tab.editMode}
+          editable={tab.editable}
           onedit={async (r, c, v) => {
             const out = await tab.updateCell(r, c, v);
             return savedMessage(tab.columns[c].name, v, out.stored, out.elapsedMs);
