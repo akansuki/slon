@@ -45,7 +45,19 @@ jobs:
           releaseName: Slon ${{ github.ref_name }}
           releaseDraft: true
           prerelease: false
+          # The draft opens with an unmissable gap where the release notes go, so it
+          # cannot be mistaken for finished. Everything below the rule is the same
+          # every time and needs no editing.
           releaseBody: |
+            ## What's new
+
+            > **Write this before publishing.** What changed since the last release, in
+            > a few bullets, from the user's side rather than the commit's.
+            > `git log <previous tag>..${{ github.ref_name }} --oneline` is the raw
+            > material, not the answer. Then delete this quote.
+
+            ---
+
             **Windows 10 or later, 64-bit.**
 
             - The **`-setup.exe`** below installs for the current user and needs no admin rights. Use this one.
