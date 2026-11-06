@@ -1693,3 +1693,283 @@ async fn a_delete_inside_the_users_transaction_leaves_it_open() {
     .await;
     assert_eq!(c.rows[0][0][0], s("5"));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cell_edit_writes_one_value_and_reads_back_what_was_stored() {
+    let cfg = cfg_or_skip!();
+    let reg = Registry::new();
+    let t = tab(&reg, &cfg).await;
+    run(
+        &reg,
+        t,
+        "DROP SCHEMA IF EXISTS slon_up CASCADE;
+         CREATE SCHEMA slon_up;
+         CREATE TABLE slon_up.t (id int PRIMARY KEY, label text, price numeric(10,2));
+         INSERT INTO slon_up.t VALUES (1, 'one', 1.00), (2, 'two', 2.00);",
+        &QueryOptions::default(),
+    )
+    .await
+    .0
+    .unwrap();
+    let (_, c) = run(&reg, t, "SELECT * FROM slon_up.t", &QueryOptions::default()).await;
+    let oid = table_oid_of(&c.columns[0]).unwrap();
+
+    let out = reg
+        .update_cell(
+            t,
+            &UpdateRequest {
+                table_oid: oid,
+                column: 2,
+                value: Some("renamed".into()),
+                old_value: Some("one".into()),
+                key: vec!["1".into()],
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.stored.as_deref(), Some("renamed"));
+    assert!(
+        out.sql
+            .starts_with("UPDATE slon_up.t\n   SET label = 'renamed'"),
+        "{}",
+        out.sql
+    );
+    assert!(
+        out.sql.contains("label::text IS NOT DISTINCT FROM 'one'"),
+        "{}",
+        out.sql
+    );
+
+    // The server's own form of the value comes back, not the text that was typed.
+    let out = reg
+        .update_cell(
+            t,
+            &UpdateRequest {
+                table_oid: oid,
+                column: 3,
+                value: Some("1.5".into()),
+                old_value: Some("1.00".into()),
+                key: vec!["1".into()],
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.stored.as_deref(), Some("1.50"));
+
+    // NULL and empty string are different values, and both survive the round trip.
+    let out = reg
+        .update_cell(
+            t,
+            &UpdateRequest {
+                table_oid: oid,
+                column: 2,
+                value: None,
+                old_value: Some("renamed".into()),
+                key: vec!["1".into()],
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.stored, None);
+    let out = reg
+        .update_cell(
+            t,
+            &UpdateRequest {
+                table_oid: oid,
+                column: 2,
+                value: Some(String::new()),
+                old_value: None,
+                key: vec!["1".into()],
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.stored.as_deref(), Some(""));
+
+    // The other row was never touched.
+    let (_, c) = run(
+        &reg,
+        t,
+        "SELECT label FROM slon_up.t WHERE id = 2",
+        &QueryOptions::default(),
+    )
+    .await;
+    assert_eq!(c.rows[0][0][0], s("two"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_edit_of_a_row_somebody_else_changed_is_refused() {
+    let cfg = cfg_or_skip!();
+    let reg = Registry::new();
+    let t = tab(&reg, &cfg).await;
+    run(
+        &reg,
+        t,
+        "DROP SCHEMA IF EXISTS slon_conflict CASCADE;
+         CREATE SCHEMA slon_conflict;
+         CREATE TABLE slon_conflict.t (id int PRIMARY KEY, label text);
+         INSERT INTO slon_conflict.t VALUES (1, 'original');",
+        &QueryOptions::default(),
+    )
+    .await
+    .0
+    .unwrap();
+    let (_, c) = run(
+        &reg,
+        t,
+        "SELECT * FROM slon_conflict.t",
+        &QueryOptions::default(),
+    )
+    .await;
+    let oid = table_oid_of(&c.columns[0]).unwrap();
+
+    // Somebody else gets there first.
+    run(
+        &reg,
+        t,
+        "UPDATE slon_conflict.t SET label = 'theirs' WHERE id = 1",
+        &QueryOptions::default(),
+    )
+    .await
+    .0
+    .unwrap();
+
+    let err = reg
+        .update_cell(
+            t,
+            &UpdateRequest {
+                table_oid: oid,
+                column: 2,
+                value: Some("mine".into()),
+                old_value: Some("original".into()),
+                key: vec!["1".into()],
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(err.message.contains("changed since"), "{}", err.message);
+
+    // Their value stands: the edit was rolled back, not merged.
+    let (_, c) = run(
+        &reg,
+        t,
+        "SELECT label FROM slon_conflict.t",
+        &QueryOptions::default(),
+    )
+    .await;
+    assert_eq!(c.rows[0][0][0], s("theirs"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn columns_the_server_will_not_accept_are_reported_as_such() {
+    let cfg = cfg_or_skip!();
+    let reg = Registry::new();
+    let t = tab(&reg, &cfg).await;
+    run(
+        &reg,
+        t,
+        "DROP SCHEMA IF EXISTS slon_gen CASCADE;
+         CREATE SCHEMA slon_gen;
+         CREATE TABLE slon_gen.t (
+           id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+           n int,
+           doubled int GENERATED ALWAYS AS (n * 2) STORED,
+           by_default int GENERATED BY DEFAULT AS IDENTITY,
+           plain text);
+         INSERT INTO slon_gen.t (n, plain) VALUES (21, 'hi');",
+        &QueryOptions::default(),
+    )
+    .await
+    .0
+    .unwrap();
+    let (_, c) = run(
+        &reg,
+        t,
+        "SELECT * FROM slon_gen.t",
+        &QueryOptions::default(),
+    )
+    .await;
+    let oid = table_oid_of(&c.columns[0]).unwrap();
+    let id = reg.row_identity(t, oid).await.unwrap();
+
+    let by_name = |n: &str| id.columns.iter().find(|c| c.name == n).unwrap().clone();
+    assert!(!by_name("id").editable);
+    assert!(by_name("id").reason.unwrap().contains("GENERATED ALWAYS"));
+    assert!(!by_name("doubled").editable);
+    assert_eq!(
+        by_name("doubled").reason.as_deref(),
+        Some("a generated column")
+    );
+    assert!(by_name("n").editable);
+    assert!(by_name("plain").editable);
+    // BY DEFAULT identity columns do accept a plain UPDATE.
+    assert!(by_name("by_default").editable);
+
+    let err = reg
+        .update_cell(
+            t,
+            &UpdateRequest {
+                table_oid: oid,
+                column: by_name("doubled").attnum,
+                value: Some("99".into()),
+                old_value: Some("42".into()),
+                key: vec!["1".into()],
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(err.message.contains("generated column"), "{}", err.message);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_edited_value_cannot_become_sql() {
+    let cfg = cfg_or_skip!();
+    let reg = Registry::new();
+    let t = tab(&reg, &cfg).await;
+    run(
+        &reg,
+        t,
+        "DROP SCHEMA IF EXISTS slon_inj CASCADE;
+         CREATE SCHEMA slon_inj;
+         CREATE TABLE slon_inj.t (id int PRIMARY KEY, label text);
+         INSERT INTO slon_inj.t VALUES (1, 'before');",
+        &QueryOptions::default(),
+    )
+    .await
+    .0
+    .unwrap();
+    let (_, c) = run(
+        &reg,
+        t,
+        "SELECT * FROM slon_inj.t",
+        &QueryOptions::default(),
+    )
+    .await;
+    let oid = table_oid_of(&c.columns[0]).unwrap();
+
+    let nasty = "'; DROP TABLE slon_inj.t; --";
+    let out = reg
+        .update_cell(
+            t,
+            &UpdateRequest {
+                table_oid: oid,
+                column: 2,
+                value: Some(nasty.into()),
+                old_value: Some("before".into()),
+                key: vec!["1".into()],
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.stored.as_deref(), Some(nasty));
+
+    // The table is still there, holding the text as data.
+    let (_, c) = run(
+        &reg,
+        t,
+        "SELECT label FROM slon_inj.t",
+        &QueryOptions::default(),
+    )
+    .await;
+    assert_eq!(c.rows[0][0][0], s(nasty));
+}

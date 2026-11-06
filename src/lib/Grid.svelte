@@ -9,6 +9,7 @@
     type Pos,
     type Selection,
   } from './selection';
+  import { toPgError } from './api';
   import type { Cell, Column } from './types';
 
   let {
@@ -18,6 +19,8 @@
     running,
     sort = $bindable(null),
     selectedRows = $bindable([]),
+    editable = [],
+    onedit,
   }: {
     columns: Column[];
     rows: Cell[][];
@@ -25,6 +28,13 @@
     running: boolean;
     sort?: SortSpec | null;
     selectedRows?: number[];
+    /** Per column: whether a cell can be written. Empty means the result is read-only. */
+    editable?: { ok: boolean; reason: string }[];
+    /**
+     * Writes one cell. What it resolves to is shown over the grid; rejecting it keeps the
+     * editor open with the reason.
+     */
+    onedit?: (dataRow: number, colIndex: number, value: string | null) => Promise<string | void>;
   } = $props();
 
   const ROW_H = 26;
@@ -42,7 +52,7 @@
   let sel = $state.raw<Selection | null>(null);
   /** Column widths the user dragged; `undefined` entries keep the automatic width. */
   let custom = $state.raw<(number | undefined)[]>([]);
-  let toast = $state<string | null>(null);
+  let toast = $state<{ text: string; bad: boolean } | null>(null);
   let toastTimer: ReturnType<typeof setTimeout> | undefined;
   let menu = $state<{ x: number; y: number } | null>(null);
 
@@ -123,6 +133,76 @@
   /** Called by the pane after rows are deleted: the old positions mean nothing now. */
   export function clearSelection() {
     sel = null;
+  }
+
+  // Inline cell editing. `at` is the visual row, as everywhere else in the grid.
+  let edit = $state<{
+    at: Pos;
+    draft: string;
+    isNull: boolean;
+    saving: boolean;
+    /** Set when the server refused the value: the editor stays open to be corrected. */
+    failed: boolean;
+  } | null>(null);
+  const canEdit = (ci: number) => Boolean(onedit) && (editable[ci]?.ok ?? false);
+
+  function startEdit(r: number, ci: number) {
+    if (!canEdit(ci) || edit?.saving) return;
+    const d = order ? order[r] : r;
+    const v = rows[d]?.[ci];
+    if (v === undefined) return;
+    edit = { at: { r, c: ci }, draft: v ?? '', isNull: v === null, saving: false, failed: false };
+  }
+
+  async function commitEdit() {
+    if (!edit || edit.saving) return;
+    const { at, draft, isNull } = edit;
+    const d = order ? order[at.r] : at.r;
+    const before = rows[d]?.[at.c];
+    const value = isNull ? null : draft;
+    if (value === before) {
+      edit = null;
+      return;
+    }
+    edit = { ...edit, saving: true };
+    try {
+      const said = await onedit?.(d, at.c, value);
+      edit = null;
+      if (said) flash(said);
+    } catch (e) {
+      // A refused value (wrong type, a constraint, a row someone else changed) keeps the
+      // editor open holding what was typed, so it can be corrected rather than retyped.
+      if (edit) edit = { ...edit, saving: false, failed: true };
+      flash(toPgError(e).message, true);
+    }
+  }
+
+  /**
+   * Focus the editor and select what is in it, so typing replaces the value. An action
+   * rather than `autofocus`: the browser focuses an autofocus element before Svelte has
+   * attached the onfocus handler, so the selection never happened.
+   */
+  function openEditor(node: HTMLInputElement) {
+    node.focus();
+    node.select();
+  }
+
+  function editKey(e: KeyboardEvent) {
+    if (!edit) return;
+    // The grid has its own key handling (select all, arrows, copy). While a cell is open
+    // those keystrokes belong to the editor.
+    e.stopPropagation();
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      void commitEdit();
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      edit = null;
+    } else if (e.key === '0' && (e.ctrlKey || e.metaKey)) {
+      // The only way to tell the grid "NULL" rather than an empty string.
+      e.preventDefault();
+      edit = { ...edit, isNull: !edit.isNull, draft: '' };
+    }
   }
 
   function ariaSort(i: number) {
@@ -269,10 +349,11 @@
     flash(ok ? `Copied ${describe(range)}${withHeaders ? ' with headers' : ''}` : 'Copy failed: clipboard not available');
   }
 
-  function flash(message: string) {
-    toast = message;
+  /** A message over the grid. Something that went wrong stays up long enough to read. */
+  function flash(text: string, bad = false) {
+    toast = { text, bad };
     clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => (toast = null), 1800);
+    toastTimer = setTimeout(() => (toast = null), bad ? 8000 : 1800);
   }
 
   function onKeyDown(e: KeyboardEvent) {
@@ -410,12 +491,36 @@
                 class:numeric={c.sortKind === 'number'}
                 class:sel={range && inRange(range, i, ci)}
                 class:focus={sel && sel.focus.r === i && sel.focus.c === ci && !sel.rows}
+                class:editable={canEdit(ci)}
+                class:readonly={editable.length > 0 && !canEdit(ci)}
                 style:width="{widths[ci]}px"
-                title={v === null ? 'NULL' : v.length > 400 ? v.slice(0, 400) + '…' : v}
+                title={editable.length > 0 && !canEdit(ci)
+                  ? editable[ci]?.reason
+                  : v === null
+                    ? 'NULL'
+                    : v.length > 400
+                      ? v.slice(0, 400) + '…'
+                      : v}
                 role="gridcell"
+                tabindex="-1"
                 aria-selected={range ? inRange(range, i, ci) : false}
+                ondblclick={() => startEdit(i, ci)}
               >
-                {#if v === null}<span class="null">NULL</span>{:else}{v}{/if}
+                {#if edit && edit.at.r === i && edit.at.c === ci}
+                  <input
+                    class="editor"
+                    class:isnull={edit.isNull}
+                    class:failed={edit.failed}
+                    use:openEditor
+                    readonly={edit.saving}
+                    value={edit.isNull ? 'NULL' : edit.draft}
+                    title="Enter saves, Escape cancels, Ctrl+0 sets NULL"
+                    data-testid="cell-editor"
+                    oninput={(e) => (edit = { ...edit!, draft: e.currentTarget.value, isNull: false })}
+                    onkeydown={editKey}
+                    onblur={() => (edit?.failed ? (edit = null) : void commitEdit())}
+                  />
+                {:else if v === null}<span class="null">NULL</span>{:else}{v}{/if}
               </div>
             {/each}
           </div>
@@ -424,7 +529,9 @@
     </div>
   </div>
 
-  {#if toast}<div class="toast" role="status" data-testid="copy-toast">{toast}</div>{/if}
+  {#if toast}
+    <div class="toast" class:bad={toast.bad} role="status" data-testid="copy-toast">{toast.text}</div>
+  {/if}
 
   {#if menu}
     <div class="ctxmenu" style:left="{menu.x}px" style:top="{menu.y}px" role="menu">
@@ -518,6 +625,33 @@
     background: var(--selected);
     color: var(--text);
   }
+  .cell.editable {
+    cursor: text;
+  }
+  /* While editing is on, the cells that cannot be written step back, so which columns
+     are writable is visible without hovering each one. */
+  .cell.readonly {
+    opacity: 0.55;
+  }
+  .editor {
+    width: 100%;
+    height: 100%;
+    padding: 0;
+    border: 0;
+    border-radius: 0;
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+    background: var(--panel);
+    color: var(--text);
+    font: inherit;
+  }
+  .editor:read-only {
+    opacity: 0.7;
+  }
+  .editor.isnull {
+    color: var(--muted);
+    font-style: italic;
+  }
   .null {
     color: var(--null);
     font-style: italic;
@@ -585,6 +719,7 @@
     position: absolute;
     right: 16px;
     bottom: 14px;
+    max-width: min(560px, calc(100% - 32px));
     padding: 6px 12px;
     border-radius: 8px;
     background: var(--text);
@@ -593,6 +728,13 @@
     font-size: 12px;
     box-shadow: 0 4px 16px rgb(0 0 0 / 0.25);
     pointer-events: none;
+  }
+  .toast.bad {
+    background: var(--danger);
+    color: #fff;
+  }
+  .editor.failed {
+    outline-color: var(--danger);
   }
   .ctxmenu {
     position: fixed;

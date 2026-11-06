@@ -27,12 +27,12 @@ EXPLAIN, messages, sidebar, triggers/sequences, export, history, restored tabs) 
 Features: connect (incl. TLS verify-ca/verify-full with PEM or OS store), lazy tree with table properties (columns, indexes,
 constraints, triggers, sequences, CREATE script), SQL editor with schema-aware autocomplete, streamed sortable grid with copy and
 resizable columns, cancel, multiple tabs, EXPLAIN / EXPLAIN ANALYZE plan view, server messages tab, resizable sidebar,
-export (CSV/TSV/JSON/JSONL), deleting selected rows from the grid without writing SQL,
+export (CSV/TSV/JSON/JSONL), deleting selected rows and editing cells in the grid without writing SQL,
 query history (Ctrl+H), remembered tabs per server, version in the sidebar footer
 (click to copy bug-report details) and the connection in the title bar.
 
-Verified on Linux (PostgreSQL 16): 7 pg-core unit + 31 integration tests, 22 pg-profiles store tests + 12 history/workspace
-tests (+1 ignored real credential store), 2 src-tauri tests, 103 UI unit tests, svelte-check clean, 158/158 end-to-end checks.
+Verified on Linux (PostgreSQL 16): 7 pg-core unit + 35 integration tests, 22 pg-profiles store tests + 12 history/workspace
+tests (+1 ignored real credential store), 2 src-tauri tests, 112 UI unit tests, svelte-check clean, 176/176 end-to-end checks.
 Not verified: Excel opening the exported CSV, Windows certificate store as trust source, real RDS / company CA, plans from other
 server versions (parser written against PG 16 JSON; PG 18 adds fields it ignores).
 
@@ -50,7 +50,7 @@ Windows (without xvfb) for the rendering users actually see.
 
 ## Layout
 - crates/pg-core: engine (tokio-postgres + rustls/ring), no UI deps; ddl.rs builds CREATE scripts; explain.rs runs EXPLAIN;
-  notice.rs collects server messages
+  notice.rs collects server messages; gridedit.rs resolves row identity and runs grid deletes and cell edits
 - crates/pg-profiles: saved connections (profiles.json + OS credential store via keyring); history.rs, workspace.rs and
   jsonfile.rs (atomic JSON files for history and tabs)
 - src-tauri: thin command layer; results stream over a Tauri Channel; export.rs (save dialog, chunked file writes)
@@ -84,6 +84,6 @@ Windows (without xvfb) for the rendering users actually see.
   statements is best effort. Results are not persisted.
 
 ## Next
-Editing cells and inserting rows in the grid (the row-identity layer is already there), copy as INSERT/JSON, export of all rows of a large result (needs a re-run), client certificates, import/export of saved
+Inserting rows in the grid, copy as INSERT/JSON, export of all rows of a large result (needs a re-run), client certificates, import/export of saved
 connections, EXPLAIN options (VERBOSE, SETTINGS, text view), comparing two plans, grants/rules/policies in table properties,
 autocomplete for CTEs/functions/types, code signing for the installers.

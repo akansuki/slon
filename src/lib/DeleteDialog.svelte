@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import { toPgError } from './api';
   import Icon from './Icon.svelte';
-  import { rowsLabel } from './rowdelete';
+  import { rowsLabel } from './griddata';
   import type { QueryTab } from './store.svelte';
   import type { DeletePlan } from './types';
 

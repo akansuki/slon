@@ -1,7 +1,7 @@
 use pg_core::{
     CompletionSchema, ConnectionConfig, ConnectionInfo, DeleteOutcome, DeletePlan, DeleteRequest,
     ExplainResult, PgError, QueryEvent, QueryOptions, Registry, Relation, RowIdentity,
-    TableDetails,
+    TableDetails, UpdateOutcome, UpdateRequest,
 };
 use pg_profiles::{
     HistoryEntry, HistoryInput, HistoryStore, KeyringSecrets, MemorySecrets, Profile, ProfileInput,
@@ -232,6 +232,15 @@ async fn delete_rows(
 }
 
 #[tauri::command]
+async fn update_cell(
+    state: State<'_, AppState>,
+    tab_id: u64,
+    request: UpdateRequest,
+) -> Result<UpdateOutcome, PgError> {
+    state.registry.update_cell(tab_id, &request).await
+}
+
+#[tauri::command]
 fn history_add(state: State<'_, AppState>, input: HistoryInput) -> Result<bool, PgError> {
     state.history.add(input)
 }
@@ -324,6 +333,7 @@ pub fn run() {
             row_identity,
             plan_delete,
             delete_rows,
+            update_cell,
             build_info,
             set_window_title,
             history_add,

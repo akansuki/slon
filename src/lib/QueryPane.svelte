@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { deletability } from './rowdelete';
+  import { deletability, savedMessage } from './griddata';
   import Editor from './Editor.svelte';
   import DeleteDialog from './DeleteDialog.svelte';
   import ExportDialog from './ExportDialog.svelte';
@@ -22,6 +22,11 @@
   let grid = $state<ReturnType<typeof Grid> | null>(null);
   const canDelete = $derived(
     deletability(tab.columns, tab.identity, tab.identityError, tab.selectedRows, running),
+  );
+  // Editing is offered only where at least one column could actually be written.
+  const anyEditable = $derived(tab.editable.some((v) => v.ok));
+  const editReason = $derived(
+    tab.editable.find((v) => !v.ok)?.reason ?? 'These rows cannot be edited',
   );
   const canExport = $derived(tab.columns.length > 0 && tab.status === 'idle' && tab.rows.length > 0);
 
@@ -140,6 +145,22 @@
     >
       <Icon name="export" size={14} /> Export
     </button>
+<!-- A switch, not a button: it turns writing on for the whole grid, so it should not look
+         like the one-shot actions beside it. -->
+    <button
+      class="toggle"
+      role="switch"
+      aria-checked={tab.editMode}
+      onclick={() => (tab.editMode = !tab.editMode)}
+      disabled={!anyEditable || running}
+      title={anyEditable
+        ? 'Let cells be edited: double-click a cell, Enter saves, Ctrl+0 sets NULL'
+        : editReason}
+      data-testid="edit-mode"
+    >
+      <span class="track"><span class="knob"></span></span>
+      {tab.editMode ? 'Editing' : 'Edit'}
+    </button>
     <button
       onclick={() => (deleting = true)}
       disabled={!canDelete.ok}
@@ -219,6 +240,11 @@
           {running}
           bind:sort={tab.sort}
           bind:selectedRows={tab.selectedRows}
+          editable={tab.editMode ? tab.editable : []}
+          onedit={async (r, c, v) => {
+            const out = await tab.updateCell(r, c, v);
+            return savedMessage(tab.columns[c].name, v, out.stored, out.elapsedMs);
+          }}
         />
       {:else if tab.message}
         <div class="placeholder">{tab.message}</div>
@@ -272,6 +298,46 @@
     flex-direction: column;
     height: 100%;
     min-height: 0;
+  }
+  .toggle {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+  }
+  .track {
+    position: relative;
+    flex: none;
+    width: 26px;
+    height: 14px;
+    border-radius: 7px;
+    background: var(--muted);
+    transition: background 0.12s ease;
+  }
+  .knob {
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: #fff;
+    transition: transform 0.12s ease;
+  }
+  .toggle[aria-checked='true'] {
+    border-color: var(--accent);
+    color: var(--text);
+  }
+  .toggle[aria-checked='true'] .track {
+    background: var(--accent);
+  }
+  .toggle[aria-checked='true'] .knob {
+    transform: translateX(12px);
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .track,
+    .knob {
+      transition: none;
+    }
   }
   .toolbar {
     display: flex;

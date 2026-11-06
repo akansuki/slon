@@ -1,4 +1,4 @@
-//! Deleting rows straight from the results grid.
+//! Changing data straight from the results grid: deleting rows, and editing single cells.
 //!
 //! A grid row can only be deleted when it can be traced back to exactly one row of one
 //! table. The server tells us which table each result column came from (`RowDescription`
@@ -10,9 +10,12 @@
 //! must be present in the result.
 //!
 //! Every identifier and every value in the generated statement is quoted by the server
-//! (`quote_ident`, `quote_literal`), never by hand. The statement shown in the confirmation
+//! (`quote_ident`, `quote_nullable`), never by hand. The statement shown in the confirmation
 //! is the statement that runs: `plan_delete` and `run_delete` build it the same way from
 //! the same input, so the preview cannot drift from what is executed.
+//!
+//! An edit also carries the value the grid was showing into the WHERE clause, so a row that
+//! somebody else changed in the meantime is reported instead of being overwritten.
 
 use std::time::Instant;
 
@@ -37,6 +40,21 @@ pub struct RowIdentity {
     pub qualified: String,
     /// The primary-key columns, in key order.
     pub key: Vec<KeyColumn>,
+    /// Every column of the table, so the grid knows which cells can be edited.
+    pub columns: Vec<TableColumn>,
+}
+
+/// A column of the source table, and whether a cell of it can be written.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TableColumn {
+    pub name: String,
+    /// Quoted by the server.
+    pub quoted: String,
+    pub attnum: i16,
+    pub editable: bool,
+    /// Why not, when it cannot be edited.
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -95,14 +113,18 @@ pub async fn row_identity(session: &Session, table_oid: u32) -> Result<RowIdenti
                 quote_ident(n.nspname) || '.' || quote_ident(c.relname),
                 a.attname,
                 quote_ident(a.attname),
-                a.attnum::text
+                a.attnum::text,
+                a.attgenerated::text,
+                a.attidentity::text,
+                (SELECT array_position(i.indkey::int2[], a.attnum)
+                   FROM pg_catalog.pg_index i
+                  WHERE i.indrelid = c.oid AND i.indisprimary)::text
          FROM pg_catalog.pg_class c
          JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-         LEFT JOIN pg_catalog.pg_index i ON i.indrelid = c.oid AND i.indisprimary
-         LEFT JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) ON true
-         LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum
+         LEFT JOIN pg_catalog.pg_attribute a
+                ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
          WHERE c.oid = {table_oid}
-         ORDER BY k.ord"
+         ORDER BY a.attnum"
     );
     let msgs = session
         .client
@@ -132,44 +154,77 @@ pub async fn row_identity(session: &Session, table_oid: u32) -> Result<RowIdenti
         _ => return Err(refuse("These rows do not come from a table.")),
     }
 
-    let mut key = Vec::new();
+    let mut columns = Vec::new();
+    // (position within the primary key, column) for the columns that make it up.
+    let mut keyed: Vec<(i32, KeyColumn)> = Vec::new();
     for r in &rows {
-        // No primary key: the LEFT JOINs leave these empty.
         let (Some(name), Some(quoted), Some(attnum)) = (r.get(4), r.get(5), r.get(6)) else {
-            continue;
+            continue; // a table with no columns at all
         };
-        key.push(KeyColumn {
+        let attnum: i16 = attnum
+            .parse()
+            .map_err(|_| refuse("Unreadable column number."))?;
+        // `attgenerated` is 's' for a stored generated column, `attidentity` 'a' for
+        // GENERATED ALWAYS AS IDENTITY. Neither accepts a plain UPDATE; 'd' (BY DEFAULT)
+        // does, so it stays editable.
+        let reason = match (r.get(7).unwrap_or(""), r.get(8).unwrap_or("")) {
+            ("s", _) => Some("a generated column".to_string()),
+            (_, "a") => Some("an identity column defined as GENERATED ALWAYS".to_string()),
+            _ => None,
+        };
+        columns.push(TableColumn {
             name: name.to_string(),
             quoted: quoted.to_string(),
-            attnum: attnum
-                .parse()
-                .map_err(|_| refuse("Unreadable column number."))?,
+            attnum,
+            editable: reason.is_none(),
+            reason,
         });
+        if let Some(ord) = r.get(9).filter(|o| !o.is_empty()) {
+            let ord: i32 = ord
+                .parse()
+                .map_err(|_| refuse("Unreadable key position."))?;
+            keyed.push((
+                ord,
+                KeyColumn {
+                    name: name.to_string(),
+                    quoted: quoted.to_string(),
+                    attnum,
+                },
+            ));
+        }
     }
-    if key.is_empty() {
+    if keyed.is_empty() {
         return Err(refuse(
             "This table has no primary key, so a row cannot be identified reliably.",
         ));
     }
+    keyed.sort_by_key(|(ord, _)| *ord);
+    let key: Vec<KeyColumn> = keyed.into_iter().map(|(_, k)| k).collect();
 
     Ok(RowIdentity {
         schema: first.get(1).unwrap_or_default().to_string(),
         table: first.get(2).unwrap_or_default().to_string(),
         qualified: first.get(3).unwrap_or_default().to_string(),
         key,
+        columns,
     })
 }
 
-/// Quote every value with the server's own `quote_literal`, in one round trip.
-async fn quote_values(session: &Session, values: &[String]) -> Result<Vec<String>, PgError> {
+/// Quote every value with the server's own `quote_nullable`, in one round trip. `None`
+/// becomes the keyword NULL, which is how a cell is set to NULL while an empty string
+/// stays an empty string.
+async fn quote_values(
+    session: &Session,
+    values: &[Option<String>],
+) -> Result<Vec<String>, PgError> {
     if values.is_empty() {
         return Ok(Vec::new());
     }
-    let owned: Vec<String> = values.to_vec();
+    let owned: Vec<Option<String>> = values.to_vec();
     let rows = session
         .client
         .query(
-            "SELECT quote_literal(v) FROM unnest($1::text[]) WITH ORDINALITY AS t(v, o) ORDER BY o",
+            "SELECT quote_nullable(v) FROM unnest($1::text[]) WITH ORDINALITY AS t(v, o) ORDER BY o",
             &[&owned],
         )
         .await
@@ -194,7 +249,7 @@ pub async fn plan_delete(session: &Session, req: &DeleteRequest) -> Result<Delet
         return Err(refuse("The key values do not match the primary key."));
     }
 
-    let flat: Vec<String> = req.rows.iter().flatten().cloned().collect();
+    let flat: Vec<Option<String>> = req.rows.iter().flatten().cloned().map(Some).collect();
     let quoted = quote_values(session, &flat).await?;
 
     let predicate = if width == 1 {
@@ -275,4 +330,131 @@ pub async fn run_delete(session: &Session, req: &DeleteRequest) -> Result<Delete
         deleted,
         elapsed_ms: started.elapsed().as_millis() as u64,
     })
+}
+
+/// One cell: which row, which column, the new value, and the value the grid was showing.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateRequest {
+    pub table_oid: u32,
+    /// Position in the table of the column being written.
+    pub column: i16,
+    /// `None` sets the cell to NULL.
+    pub value: Option<String>,
+    /// What the grid was showing, used to detect a row somebody else changed meanwhile.
+    pub old_value: Option<String>,
+    /// The row's key values, in key order.
+    pub key: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateOutcome {
+    pub sql: String,
+    /// What the column holds now, read back from the server: writing `1.5` into a
+    /// `numeric(10,2)` stores `1.50`, and the grid should show that rather than the text
+    /// that was typed.
+    pub stored: Option<String>,
+    pub elapsed_ms: u64,
+}
+
+/// Build the UPDATE for one cell. Separate from running it so a test, and a future
+/// preview, see exactly the statement that would be sent.
+async fn plan_update(
+    session: &Session,
+    req: &UpdateRequest,
+) -> Result<(String, RowIdentity), PgError> {
+    let identity = row_identity(session, req.table_oid).await?;
+    if req.key.len() != identity.key.len() {
+        return Err(refuse("The key values do not match the primary key."));
+    }
+    let column = identity
+        .columns
+        .iter()
+        .find(|c| c.attnum == req.column)
+        .ok_or_else(|| refuse("That column is no longer part of the table."))?;
+    if let Some(reason) = &column.reason {
+        return Err(refuse(format!("{} is {reason}.", column.name)));
+    }
+
+    // One round trip quotes the new value, the old one and every key value.
+    let mut values: Vec<Option<String>> = vec![req.value.clone(), req.old_value.clone()];
+    values.extend(req.key.iter().cloned().map(Some));
+    let q = quote_values(session, &values).await?;
+    let (new_value, old_value, keys) = (&q[0], &q[1], &q[2..]);
+
+    let mut wheres: Vec<String> = identity
+        .key
+        .iter()
+        .zip(keys)
+        .map(|(k, v)| format!("{} = {v}", k.quoted))
+        .collect();
+    // The guard that turns a silent overwrite into a reported conflict. Compared as text
+    // because that is exactly what the grid showed, and because some types (json, xml)
+    // have no equality operator of their own. IS NOT DISTINCT FROM so NULL matches NULL.
+    wheres.push(format!(
+        "{}::text IS NOT DISTINCT FROM {old_value}",
+        column.quoted
+    ));
+
+    Ok((
+        format!(
+            "UPDATE {}\n   SET {} = {new_value}\n WHERE {}\nRETURNING {}::text",
+            identity.qualified,
+            column.quoted,
+            wheres.join("\n   AND "),
+            column.quoted
+        ),
+        identity,
+    ))
+}
+
+/// Write one cell, and give back what the column holds afterwards.
+///
+/// Exactly one row must match: zero means the row changed or went away since the query
+/// ran, and in that case nothing is written and the grid keeps showing the old value.
+pub async fn run_update(session: &Session, req: &UpdateRequest) -> Result<UpdateOutcome, PgError> {
+    let (sql, _) = plan_update(session, req).await?;
+    let _guard = session.begin_query()?;
+    let started = Instant::now();
+    let client = &session.client;
+
+    let in_user_txn = match client.simple_query("SAVEPOINT slon_update").await {
+        Ok(_) => true,
+        Err(e) if e.code() == Some(&SqlState::NO_ACTIVE_SQL_TRANSACTION) => {
+            client
+                .simple_query("BEGIN")
+                .await
+                .map_err(|e| query_err(&e))?;
+            false
+        }
+        Err(e) => return Err(query_err(&e)),
+    };
+
+    let result = client.query(sql.as_str(), &[]).await;
+    let keep = matches!(&result, Ok(rows) if rows.len() == 1);
+    let finish = match (keep, in_user_txn) {
+        (true, true) => "RELEASE SAVEPOINT slon_update",
+        (true, false) => "COMMIT",
+        (false, true) => "ROLLBACK TO SAVEPOINT slon_update; RELEASE SAVEPOINT slon_update",
+        (false, false) => "ROLLBACK",
+    };
+    let finished = client.simple_query(finish).await;
+
+    let rows = result.map_err(|e| query_err(&e))?;
+    finished.map_err(|e| query_err(&e))?;
+    match rows.len() {
+        1 => Ok(UpdateOutcome {
+            sql,
+            stored: rows[0].get::<_, Option<String>>(0),
+            elapsed_ms: started.elapsed().as_millis() as u64,
+        }),
+        0 => Err(refuse(
+            "This row changed since the query ran, so nothing was written. \
+             Run the query again to see the current values.",
+        )),
+        n => Err(refuse(format!(
+            "The key matched {n} rows instead of one, so nothing was written."
+        ))),
+    }
 }

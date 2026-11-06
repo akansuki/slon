@@ -281,12 +281,41 @@ export interface KeyColumn {
   attnum: number;
 }
 
+/** A column of the source table, and whether the server would accept an UPDATE of it. */
+export interface TableColumn {
+  name: string;
+  quoted: string;
+  attnum: number;
+  editable: boolean;
+  /** Why not, when it cannot be edited. */
+  reason: string | null;
+}
+
 export interface RowIdentity {
   schema: string;
   table: string;
   /** Quoted by the server, ready for SQL. */
   qualified: string;
   key: KeyColumn[];
+  columns: TableColumn[];
+}
+
+export interface UpdateRequest {
+  tableOid: number;
+  /** Position in the table of the column being written. */
+  column: number;
+  /** null sets the cell to NULL. */
+  value: string | null;
+  /** What the grid was showing, so a row changed by someone else is reported. */
+  oldValue: string | null;
+  key: string[];
+}
+
+export interface UpdateOutcome {
+  sql: string;
+  /** What the column holds now, as the server renders it. */
+  stored: string | null;
+  elapsedMs: number;
 }
 
 export interface DeleteRequest {

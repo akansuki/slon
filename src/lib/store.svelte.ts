@@ -2,7 +2,8 @@ import { api, toPgError } from './api';
 import { looksLikeDdl, quoteIfNeeded } from './completion';
 import { parsePlan, type ParsedPlan } from './plan';
 import { diagnostics } from './about';
-import { keyIndexes, keyValues, sourceTableOid } from './rowdelete';
+import { editableColumns, keyIndexes, keyValues, sourceTableOid } from './griddata';
+import type { Verdict } from './griddata';
 import { copyText } from './selection';
 import type { SortSpec } from './sort';
 import type {
@@ -12,6 +13,7 @@ import type {
   DeleteOutcome,
   DeletePlan,
   RowIdentity,
+  UpdateOutcome,
   CompletionSchema,
   ConnectionConfig,
   ConnectionInfo,
@@ -55,6 +57,13 @@ export class QueryTab {
   identity = $state.raw<RowIdentity | null>(null);
   identityError = $state<string | null>(null);
   private identitySeq = 0;
+  /**
+   * Whether cells can be typed into. Off for every new result: writing to a table should
+   * take a deliberate act, not a stray double-click.
+   */
+  editMode = $state(false);
+  /** Per result column, whether it can be written and why not. */
+  editable = $derived<Verdict[]>(editableColumns(this.columns, this.identity));
 
   /** Text for non-row results ("INSERT 0 3"-style) and the status bar. */
   message = $state<string | null>(null);
@@ -274,6 +283,7 @@ export class QueryTab {
     this.identity = null;
     this.identityError = null;
     this.selectedRows = [];
+    this.editMode = false;
     if (oid === null || this.backendId === null) return;
     try {
       const id = await api.rowIdentity(this.backendId, oid);
@@ -290,6 +300,41 @@ export class QueryTab {
     const indexes = keyIndexes(this.columns, this.identity);
     if (!indexes) return null;
     return keyValues(this.rows, this.selectedRows, indexes);
+  }
+
+  /**
+   * Write one cell. `value` of null means NULL. The grid is updated with what the server
+   * stored, which is not always the text that was typed: `1.5` in a numeric(10,2) is 1.50.
+   *
+   * Throws when the row changed since the query ran, in which case nothing was written and
+   * the grid keeps showing the old value.
+   */
+  async updateCell(dataRow: number, colIndex: number, value: string | null): Promise<UpdateOutcome> {
+    const column = this.columns[colIndex];
+    const attnum = column?.columnId;
+    if (this.backendId === null || this.tableOid === null || !this.identity || attnum == null) {
+      throw new Error('This cell cannot be identified.');
+    }
+    const indexes = keyIndexes(this.columns, this.identity);
+    const key = indexes && keyValues(this.rows, [dataRow], indexes);
+    if (!key) throw new Error('This row cannot be identified.');
+
+    const out = await api.updateCell(this.backendId, {
+      tableOid: this.tableOid,
+      column: attnum,
+      value,
+      oldValue: this.rows[dataRow][colIndex],
+      key: key[0],
+    });
+    // Replace the row rather than mutating it: `rows` is a raw state, so the grid is told
+    // to redraw by the version bump, and a stale reference cannot linger.
+    const next = this.rows.slice();
+    const row = next[dataRow].slice();
+    row[colIndex] = out.stored;
+    next[dataRow] = row;
+    this.rows = next;
+    this.rowsVersion++;
+    return out;
   }
 
   /** The statement that deleting the selection would run, for the confirmation. */

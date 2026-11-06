@@ -7,10 +7,11 @@ mod config;
 mod ddl;
 mod error;
 mod explain;
+mod gridedit;
 mod notice;
 mod query;
 mod registry;
-mod rowdelete;
+
 mod session;
 mod tls;
 
@@ -22,9 +23,10 @@ pub use catalog::{
 pub use config::{ConnectionConfig, SslMode};
 pub use error::{ErrorKind, PgError};
 pub use explain::ExplainResult;
+pub use gridedit::{
+    DeleteOutcome, DeletePlan, DeleteRequest, KeyColumn, RowIdentity, TableColumn, UpdateOutcome,
+    UpdateRequest, MAX_ROWS as MAX_DELETE_ROWS,
+};
 pub use notice::ServerMessage;
 pub use query::{Column, QueryEvent, QueryOptions, QuerySummary, SortKind};
 pub use registry::{ConnectionInfo, Registry};
-pub use rowdelete::{
-    DeleteOutcome, DeletePlan, DeleteRequest, KeyColumn, RowIdentity, MAX_ROWS as MAX_DELETE_ROWS,
-};

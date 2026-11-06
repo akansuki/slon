@@ -20,6 +20,7 @@ This is a **vertical slice**, not a pgAdmin clone. It does these things and trie
 | Explain | **Explain** and **Explain analyze** in a plan tree with per-node time share, bad row estimates, spills to disk and other warnings |
 | Messages | `RAISE NOTICE`, warnings and `VACUUM VERBOSE` output in their own tab, live while the statement runs |
 | Export | the grid's rows as **CSV, TSV, JSON or JSON Lines**, in the sorted order shown |
+| Edit | switch on **Edit** and type into a cell: one UPDATE, guarded against a row someone else changed; Ctrl+0 writes NULL |
 | Delete | select whole rows and **delete them without writing SQL** — only where the rows trace back to one table with a primary key; the exact statement is shown first and rolled back unless it matches |
 | History | every statement you ran, searchable, reopened in a tab (`Ctrl+H`); password-looking statements are never recorded |
 | Tabs | multiple query tabs, one dedicated connection each; real server-side **cancellation**; tabs come back when you reconnect to the same server |

@@ -8,8 +8,10 @@ use crate::catalog::{self, CompletionSchema, Relation, TableDetails};
 use crate::config::ConnectionConfig;
 use crate::error::PgError;
 use crate::explain::{self, ExplainResult};
+use crate::gridedit::{
+    self, DeleteOutcome, DeletePlan, DeleteRequest, RowIdentity, UpdateOutcome, UpdateRequest,
+};
 use crate::query::{self, QueryEvent, QueryOptions, QuerySummary};
-use crate::rowdelete::{self, DeleteOutcome, DeletePlan, DeleteRequest, RowIdentity};
 use crate::session::Session;
 
 #[derive(Debug, Clone, Serialize)]
@@ -219,7 +221,7 @@ impl Registry {
     /// The table and primary key behind a result column's table OID.
     pub async fn row_identity(&self, tab_id: u64, table_oid: u32) -> Result<RowIdentity, PgError> {
         let session = self.tab_session(tab_id)?;
-        rowdelete::row_identity(&session, table_oid).await
+        gridedit::row_identity(&session, table_oid).await
     }
 
     /// The DELETE that `delete_rows` would run, for the confirmation dialog.
@@ -229,7 +231,7 @@ impl Registry {
         req: &DeleteRequest,
     ) -> Result<DeletePlan, PgError> {
         let session = self.tab_session(tab_id)?;
-        rowdelete::plan_delete(&session, req).await
+        gridedit::plan_delete(&session, req).await
     }
 
     /// Deletes the selected rows, rolling back unless exactly they were deleted.
@@ -239,7 +241,17 @@ impl Registry {
         req: &DeleteRequest,
     ) -> Result<DeleteOutcome, PgError> {
         let session = self.tab_session(tab_id)?;
-        rowdelete::run_delete(&session, req).await
+        gridedit::run_delete(&session, req).await
+    }
+
+    /// Writes one cell, refusing if the row changed since the query ran.
+    pub async fn update_cell(
+        &self,
+        tab_id: u64,
+        req: &UpdateRequest,
+    ) -> Result<UpdateOutcome, PgError> {
+        let session = self.tab_session(tab_id)?;
+        gridedit::run_update(&session, req).await
     }
 
     /// Cancels the statement running in `tab_id`. Safe to call when nothing is running.

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { deletability, keyIndexes, keyValues, rowsLabel, sourceTableOid } from './rowdelete';
+import { deletability, editableColumns, keyIndexes, keyValues, rowsLabel, savedMessage, sourceTableOid } from './griddata';
 import type { Column, RowIdentity } from './types';
 
 const col = (name: string, tableOid: number | null, columnId: number | null): Column => ({
@@ -18,6 +18,11 @@ const identity: RowIdentity = {
   table: 'items',
   qualified: 'shop.items',
   key: [{ name: 'id', quoted: 'id', attnum: 1 }],
+  columns: [
+    { name: 'id', quoted: 'id', attnum: 1, editable: true, reason: null },
+    { name: 'label', quoted: 'label', attnum: 2, editable: true, reason: null },
+    { name: 'doubled', quoted: 'doubled', attnum: 3, editable: false, reason: 'a generated column' },
+  ],
 };
 const composite: RowIdentity = {
   schema: 'shop',
@@ -26,6 +31,10 @@ const composite: RowIdentity = {
   key: [
     { name: 'a', quoted: 'a', attnum: 1 },
     { name: 'b', quoted: 'b', attnum: 2 },
+  ],
+  columns: [
+    { name: 'a', quoted: 'a', attnum: 1, editable: true, reason: null },
+    { name: 'b', quoted: 'b', attnum: 2, editable: true, reason: null },
   ],
 };
 
@@ -133,5 +142,53 @@ describe('rowsLabel', () => {
     expect(rowsLabel(1)).toBe('1 row');
     expect(rowsLabel(2)).toBe('2 rows');
     expect(rowsLabel(1500)).toBe('1,500 rows');
+  });
+});
+
+describe('editableColumns', () => {
+  it('allows the stored columns of the source table', () => {
+    const v = editableColumns(fromItems, identity);
+    expect(v.map((x) => x.ok)).toEqual([true, true]);
+  });
+
+  it('refuses a generated column and names it', () => {
+    const cols = [col('id', 42, 1), col('doubled', 42, 3)];
+    const v = editableColumns(cols, identity);
+    expect(v[1].ok).toBe(false);
+    expect(v[1].reason).toBe('doubled is a generated column');
+  });
+
+  it('refuses a computed column, which has no position in the table', () => {
+    const cols = [col('id', 42, 1), col('twice', 42, null)];
+    const v = editableColumns(cols, identity);
+    expect(v[1].ok).toBe(false);
+    expect(v[1].reason).toMatch(/computed/);
+  });
+
+  it('makes the whole result read-only when the key is missing', () => {
+    const v = editableColumns([col('label', 42, 2)], identity);
+    expect(v.every((x) => !x.ok)).toBe(true);
+    expect(v[0].reason).toContain('(id)');
+  });
+
+  it('makes the whole result read-only when there is no identity at all', () => {
+    const v = editableColumns(fromItems, null);
+    expect(v.every((x) => !x.ok)).toBe(true);
+  });
+});
+
+describe('savedMessage', () => {
+  it('confirms the write when the value went in as typed', () => {
+    expect(savedMessage('label', 'hi', 'hi', 4)).toBe('Saved label in 4 ms');
+  });
+  it('says what was stored when the server rendered it differently', () => {
+    expect(savedMessage('price', '1.5', '1.50', 4)).toBe('Saved price as 1.50');
+  });
+  it('names NULL rather than showing nothing', () => {
+    expect(savedMessage('label', '', null, 4)).toBe('Saved label as NULL');
+    expect(savedMessage('label', null, null, 4)).toBe('Saved label in 4 ms');
+  });
+  it('shortens a long value so the toast stays readable', () => {
+    expect(savedMessage('notes', 'x', 'y'.repeat(100), 4)).toBe(`Saved notes as ${'y'.repeat(40)}…`);
   });
 });

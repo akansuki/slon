@@ -1,6 +1,7 @@
 /**
- * Working out whether the rows selected in the grid can be deleted, and which key values
- * identify them. Pure functions, no DOM and no API calls.
+ * Working out what the grid is allowed to change: which rows can be deleted, which cells
+ * can be edited, and the key values that identify a row. Pure functions, no DOM and no
+ * API calls.
  *
  * The server tells us, per result column, which table it came from (`tableOid`) and its
  * position in that table (`columnId`). A row is only deletable when every column came from
@@ -31,9 +32,10 @@ export function keyIndexes(columns: Column[], identity: RowIdentity): number[] |
     return out;
 }
 
-export interface Deletability {
+/** Whether an action is allowed, and what to say when it is not. */
+export interface Verdict {
     ok: boolean;
-    /** Why not, phrased for a tooltip. Empty when deletable. */
+    /** Phrased for a tooltip. Empty when allowed. */
     reason: string;
 }
 
@@ -47,7 +49,7 @@ export function deletability(
     identityError: string | null,
     selectedRows: number[],
     running: boolean,
-): Deletability {
+): Verdict {
     if (running) return { ok: false, reason: 'Wait for the query to finish' };
     if (columns.length === 0) return { ok: false, reason: 'No results to delete from' };
     if (sourceTableOid(columns) === null) {
@@ -100,4 +102,45 @@ export function keyValues(
 /** "1 row" / "3 rows", used in the button and the confirmation. */
 export function rowsLabel(n: number): string {
     return `${n.toLocaleString()} row${n === 1 ? '' : 's'}`;
+}
+
+/**
+ * Whether each result column can be written, in column order. A column is editable when it
+ * is a real column of the source table and the server would accept an UPDATE of it, so a
+ * computed column, a generated column and a GENERATED ALWAYS identity are all excluded.
+ *
+ * The whole result is read-only unless the row can be identified at all, because an edit
+ * needs the same key a delete does.
+ */
+export function editableColumns(columns: Column[], identity: RowIdentity | null): Verdict[] {
+    const none = (reason: string) => columns.map(() => ({ ok: false, reason }));
+    if (!identity) return none('These rows do not come from a table that can be edited');
+    if (keyIndexes(columns, identity) === null) {
+        const missing = identity.key.map((k) => k.name).join(', ');
+        return none(`Add the primary key (${missing}) to the query to edit these rows`);
+    }
+    return columns.map((c) => {
+        const source = c.columnId === null ? undefined : identity.columns.find((t) => t.attnum === c.columnId);
+        if (!source) return { ok: false, reason: `${c.name} is computed, not a stored column` };
+        if (!source.editable) return { ok: false, reason: `${source.name} is ${source.reason}` };
+        return { ok: true, reason: '' };
+    });
+}
+
+/**
+ * What to say after a cell is written. When the server stored something other than what
+ * was typed — `1.5` into a `numeric(10,2)` becomes `1.50` — the message says so, because
+ * otherwise the value visibly changing looks like the edit went wrong.
+ */
+export function savedMessage(
+    column: string,
+    typed: string | null,
+    stored: string | null,
+    elapsedMs: number,
+): string {
+    const show = (v: string | null) =>
+        v === null ? 'NULL' : v.length > 40 ? `${v.slice(0, 40)}…` : v;
+    return stored === typed
+        ? `Saved ${column} in ${elapsedMs} ms`
+        : `Saved ${column} as ${show(stored)}`;
 }

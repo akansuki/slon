@@ -19,6 +19,8 @@ import type {
   Relation,
   RowIdentity,
   TableDetails,
+  UpdateOutcome,
+  UpdateRequest,
   Workspace,
 } from './types';
 
@@ -73,6 +75,8 @@ export const api = {
     call<DeletePlan>('plan_delete', { tabId, request }),
   deleteRows: (tabId: number, request: DeleteRequest) =>
     call<DeleteOutcome>('delete_rows', { tabId, request }),
+  updateCell: (tabId: number, request: UpdateRequest) =>
+    call<UpdateOutcome>('update_cell', { tabId, request }),
   historyAdd: (input: HistoryInput) => call<boolean>('history_add', { input }),
   historyList: (search: string | null, server: string | null, limit = 200) =>
     call<HistoryEntry[]>('history_list', { search, server, limit }),
