@@ -27,12 +27,14 @@ EXPLAIN, messages, sidebar, triggers/sequences, export, history, restored tabs) 
 Features: connect (incl. TLS verify-ca/verify-full with PEM or OS store), lazy tree with table properties (columns, indexes,
 constraints, triggers, sequences, CREATE script), SQL editor with schema-aware autocomplete, streamed sortable grid with copy and
 resizable columns, cancel, multiple tabs, EXPLAIN / EXPLAIN ANALYZE plan view, server messages tab, resizable sidebar,
-export (CSV/TSV/JSON/JSONL), deleting selected rows and editing cells in the grid without writing SQL,
+export (CSV/TSV/JSON/JSONL) of the grid's rows or of a whole result past the 100,000-row cap,
+deleting selected rows and editing cells in the grid without writing SQL,
 query history (Ctrl+H), remembered tabs per server, version in the sidebar footer
 (click to copy bug-report details) and the connection in the title bar.
 
-Verified on Linux (PostgreSQL 16): 7 pg-core unit + 37 integration tests, 22 pg-profiles store tests + 12 history/workspace
-tests (+1 ignored real credential store), 2 src-tauri tests, 112 UI unit tests, svelte-check clean, 176/176 end-to-end checks.
+Verified on Linux (PostgreSQL 16): 23 pg-core unit + 39 integration tests, 22 pg-profiles store tests + 12 history/workspace
+tests (+1 ignored real credential store), 2 src-tauri tests, 101 UI unit tests, svelte-check clean, 182/182 end-to-end checks.
+A 2,000,000-row export (143 MB) ran in 2.9 s with the engine's peak RSS at 5 MB.
 Not verified: Excel opening the exported CSV, Windows certificate store as trust source, real RDS / company CA, plans from other
 server versions (parser written against PG 16 JSON; PG 18 adds fields it ignores).
 
@@ -50,12 +52,15 @@ Windows (without xvfb) for the rendering users actually see.
 
 ## Layout
 - crates/pg-core: engine (tokio-postgres + rustls/ring), no UI deps; ddl.rs builds CREATE scripts; explain.rs runs EXPLAIN;
-  notice.rs collects server messages; gridedit.rs resolves row identity and runs grid deletes and cell edits
+  notice.rs collects server messages; gridedit.rs resolves row identity and runs grid deletes and cell edits;
+  export.rs is the CSV/JSON formatter for both export paths; query.rs defines the RowSink that streams a result to a file
 - crates/pg-profiles: saved connections (profiles.json + OS credential store via keyring); history.rs, workspace.rs and
   jsonfile.rs (atomic JSON files for history and tabs)
-- src-tauri: thin command layer; results stream over a Tauri Channel; export.rs (save dialog, chunked file writes)
-- src: Svelte UI (plan.ts, export.ts, history.ts, layout.ts pure helpers with tests; PlanView, MessagesView, ExportDialog,
-  HistoryPanel components); e2e: WebDriver test; scripts/test-db.sh: throwaway Postgres (private CA, TLS) for tests
+- src-tauri: thin command layer; results stream over a Tauri Channel; export.rs (save dialog, `.part` files, the FileSink
+  that writes a streaming export)
+- src: Svelte UI (plan.ts, history.ts, layout.ts pure helpers with tests; export.ts holds only the options and file names;
+  PlanView, MessagesView, ExportDialog, HistoryPanel components); e2e: WebDriver test; scripts/test-db.sh: throwaway
+  Postgres (private CA, TLS) for tests
 
 ## Decisions
 - Simple query protocol (text values, multi-statement scripts); column types via a prior `prepare` (single statement only).
@@ -78,8 +83,14 @@ Windows (without xvfb) for the rendering users actually see.
   One statement only (`prepare`d first). Not rolled back by Postgres: sequence values, outside-world calls.
 - Server messages: connection driven through `poll_message`, queued in a NoticeBox; only order and elapsed time are reliable;
   cap 10,000 per run; LISTEN/NOTIFY not shown.
-- Export: rows the grid holds (<=100,000), in displayed sort order. CSV per RFC 4180, NULL = empty field, empty string = `""`;
-  JSON numbers keep server digits. The page may only write to a path the Rust-side save dialog returned.
+- Export: *Export* writes the rows the grid holds (<=100,000), in displayed sort order; *Export all rows* runs the statement
+  once and streams every row to the file while the grid still shows its capped preview, so it is bounded by disk, not memory.
+  One statement only (checked by the `prepare` that already runs), and it must return rows. Bytes go to `<name>.part` and the
+  file is renamed only when complete. CSV per RFC 4180, NULL = empty field, empty string = `""`; JSON numbers keep server
+  digits. The page may only write to a path the Rust-side save dialog returned.
+- The file format is formatted in Rust (`pg-core/src/export.rs`), not in the page: streamed rows must not pass through the
+  WebView, and two implementations of one format would drift. The port was diffed against the TypeScript original.
+- Debug builds accept `SLON_MAX_ROWS` so the end-to-end test can shrink the grid's cap (it is 20,000 there).
 - History/tabs: plain-text JSON files in the config folder, atomic writes; a damaged file is moved to `*.bad`. Password check on
   statements is best effort. Results are not persisted.
 - Grid writes: catalog lookup, value quoting and the `SAVEPOINT` transaction probe are pipelined into one round trip
@@ -90,6 +101,6 @@ Windows (without xvfb) for the rendering users actually see.
   `delete_rows`, `update_cell`), so a grid write cannot interleave with a statement running in the same tab.
 
 ## Next
-Inserting rows in the grid, copy as INSERT/JSON, export of all rows of a large result (needs a re-run), client certificates, import/export of saved
+Inserting rows in the grid, copy as INSERT/JSON, client certificates, import/export of saved
 connections, EXPLAIN options (VERBOSE, SETTINGS, text view), comparing two plans, grants/rules/policies in table properties,
 autocomplete for CTEs/functions/types, code signing for the installers.

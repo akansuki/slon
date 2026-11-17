@@ -3,6 +3,7 @@
   import Editor from './Editor.svelte';
   import DeleteDialog from './DeleteDialog.svelte';
   import ExportDialog from './ExportDialog.svelte';
+  import type { ExportOptions } from './export';
   import Grid from './Grid.svelte';
   import Icon from './Icon.svelte';
   import MessagesView from './MessagesView.svelte';
@@ -17,7 +18,8 @@
   let editorHeight = $state(260);
 
   const running = $derived(tab.status === 'running');
-  let exporting = $state(false);
+  /** Which export dialog is open, if any: the grid's rows or the whole result. */
+  let exporting = $state<'grid' | 'all' | null>(null);
   let deleting = $state(false);
   let grid = $state<ReturnType<typeof Grid> | null>(null);
   const canDelete = $derived(
@@ -29,6 +31,15 @@
     tab.editable.find((v) => !v.ok)?.reason ?? 'These rows cannot be edited',
   );
   const canExport = $derived(tab.columns.length > 0 && tab.status === 'idle' && tab.rows.length > 0);
+  // Exporting everything needs a statement, not a result: it runs the thing itself.
+  const canExportAll = $derived(tab.status === 'idle' && tab.sql.trim().length > 0);
+
+  /** Run the statement in the editor, writing every row it returns to `path`. */
+  async function exportAll(options: ExportOptions): Promise<boolean> {
+    const { text, offset } = editor.getRunText();
+    editor.clearError();
+    return tab.exportAll(text, options, offset);
+  }
 
   function run() {
     if (tab.status !== 'idle') return;
@@ -104,12 +115,14 @@
 
 {#if exporting}
   <ExportDialog
+    scope={exporting}
     columns={tab.columns}
     rows={tab.rows}
     sort={tab.sort}
     truncated={tab.truncated}
-    onclose={() => (exporting = false)}
+    onclose={() => (exporting = null)}
     ondone={(m) => app.flash(m)}
+    onall={exportAll}
   />
 {/if}
 
@@ -138,12 +151,20 @@
       <Icon name="plan" size={14} /> Explain analyze
     </button>
     <button
-      onclick={() => (exporting = true)}
+      onclick={() => (exporting = 'grid')}
       disabled={!canExport}
       title="Save the rows in the grid as CSV or JSON"
       data-testid="export"
     >
       <Icon name="export" size={14} /> Export
+    </button>
+    <button
+      onclick={() => (exporting = 'all')}
+      disabled={!canExportAll}
+      title="Run the statement and write every row it returns to a file, past the grid's 100,000-row limit"
+      data-testid="export-all"
+    >
+      <Icon name="export" size={14} /> Export all rows
     </button>
 <!-- A switch, not a button: it turns writing on for the whole grid, so it should not look
          like the one-shot actions beside it. -->
@@ -283,6 +304,12 @@
           <span class="warntext">
             Showing only the first {rowCount.toLocaleString()} rows; sorting applies to these rows only
           </span>
+        </span>
+      {/if}
+      {#if tab.exported}
+        <span class="sep">·</span>
+        <span data-testid="exported-note">
+          {tab.exported.rows.toLocaleString()} row{tab.exported.rows === 1 ? '' : 's'} written to file
         </span>
       {/if}
     {:else if tab.elapsedMs !== null}

@@ -3,55 +3,40 @@
   import { api, toPgError } from './api';
   import {
     CHUNK_ROWS,
-    DEFAULT_OPTIONS,
-    exportFooter,
-    exportHeader,
-    exportRows,
     extensionFor,
+    labelFor,
+    loadOptions,
+    rememberOptions,
     suggestName,
-    type Delimiter,
-    type ExportFormat,
     type ExportOptions,
   } from './export';
   import { sortedOrder, type SortSpec } from './sort';
   import type { Cell, Column } from './types';
 
   let {
+    scope,
     columns,
     rows,
     sort,
     truncated,
     onclose,
     ondone,
+    onall,
   }: {
+    /**
+     * `grid` saves the rows the grid holds, in the order on screen. `all` hands the chosen
+     * options back so the caller can re-run the statement and stream every row to the file;
+     * sorting is not offered there, because rows are written as they arrive.
+     */
+    scope: 'grid' | 'all';
     columns: Column[];
     rows: Cell[][];
     sort: SortSpec | null;
     truncated: boolean;
     onclose: () => void;
     ondone: (message: string) => void;
+    onall: (options: ExportOptions) => Promise<boolean>;
   } = $props();
-
-  const KEY = 'slon.exportOptions';
-
-  function loadOptions(): ExportOptions {
-    try {
-      const raw = JSON.parse(localStorage.getItem(KEY) ?? 'null');
-      if (raw && typeof raw === 'object') {
-        const format: ExportFormat = ['csv', 'json', 'jsonl'].includes(raw.format) ? raw.format : DEFAULT_OPTIONS.format;
-        const delimiter: Delimiter = [',', ';', '\t'].includes(raw.delimiter) ? raw.delimiter : DEFAULT_OPTIONS.delimiter;
-        return {
-          format,
-          delimiter,
-          header: typeof raw.header === 'boolean' ? raw.header : DEFAULT_OPTIONS.header,
-          bom: typeof raw.bom === 'boolean' ? raw.bom : DEFAULT_OPTIONS.bom,
-        };
-      }
-    } catch {
-      /* start from the defaults */
-    }
-    return { ...DEFAULT_OPTIONS };
-  }
 
   let options = $state<ExportOptions>(loadOptions());
   let busy = $state(false);
@@ -61,19 +46,8 @@
 
   const total = $derived(rows.length);
   const ext = $derived(extensionFor(options));
-  const label = $derived(
-    options.format === 'csv' ? (options.delimiter === '\t' ? 'Tab-separated values' : 'CSV') : options.format === 'json' ? 'JSON' : 'JSON Lines',
-  );
 
   onMount(() => dialogEl.querySelector<HTMLElement>('select, button')?.focus());
-
-  function remember() {
-    try {
-      localStorage.setItem(KEY, JSON.stringify(options));
-    } catch {
-      /* not remembered */
-    }
-  }
 
   async function save() {
     if (busy) return;
@@ -82,9 +56,15 @@
     written = 0;
     try {
       const o = $state.snapshot(options);
-      remember();
-      const exts = [extensionFor(o)];
-      const path = await api.chooseExportPath(suggestName(o), label, exts);
+      rememberOptions(o);
+      if (scope === 'all') {
+        // The run owns the file from here: it picks the path, executes once, and streams
+        // every row out. Closing only when something was actually started keeps the dialog
+        // up if the save dialog was dismissed.
+        if (await onall(o)) onclose();
+        return;
+      }
+      const path = await api.chooseExportPath(suggestName(o), labelFor(o), [extensionFor(o)]);
       if (path === null) return; // dialog cancelled, stay open
       // The order on screen: rows are never moved in the grid, so apply the sort here.
       let source: readonly Cell[][] = rows;
@@ -92,14 +72,12 @@
         const order = sortedOrder(rows, sort.col, columns[sort.col]?.sortKind ?? 'unknown', sort.dir);
         source = Array.from(order, (i) => rows[i]);
       }
-      await api.writeExport(path, exportHeader(columns, o), false);
-      for (let from = 0; from < source.length; from += CHUNK_ROWS) {
+      // An empty result still has to produce a well-formed file, so write once either way.
+      for (let from = 0; from === 0 || from < source.length; from += CHUNK_ROWS) {
         const to = Math.min(from + CHUNK_ROWS, source.length);
-        await api.writeExport(path, exportRows(columns, source, from, to, o), true);
+        await api.writeExportRows(path, columns, source.slice(from, to) as Cell[][], o, from, to >= source.length);
         written = to;
       }
-      const footer = exportFooter(source.length, o);
-      if (footer) await api.writeExport(path, footer, true);
       ondone(`Saved ${source.length.toLocaleString()} row${source.length === 1 ? '' : 's'} to ${path}`);
       onclose();
     } catch (e) {
@@ -125,21 +103,33 @@
     class="dialog"
     role="dialog"
     aria-modal="true"
-    aria-label="Export results"
+    aria-label={scope === 'all' ? 'Export all rows' : 'Export results'}
     tabindex="-1"
     bind:this={dialogEl}
     onclick={(e) => e.stopPropagation()}
     data-testid="export-dialog"
   >
-    <h2>Export results</h2>
-    <p class="what" data-testid="export-summary">
-      {total.toLocaleString()} row{total === 1 ? '' : 's'}, {columns.length} column{columns.length === 1 ? '' : 's'}
-      {sort ? ', in the sorted order shown' : ''}
-    </p>
-    {#if truncated}
-      <p class="warn" data-testid="export-truncated">
-        The grid holds only the first {total.toLocaleString()} rows of the result, so that is all that will be saved.
+    <h2>{scope === 'all' ? 'Export all rows' : 'Export results'}</h2>
+    {#if scope === 'all'}
+      <p class="what" data-testid="export-summary">
+        The statement is run and every row it returns is written straight to the file, so
+        the grid's 100,000-row limit does not apply.
       </p>
+      <p class="hint">
+        Rows are written as they arrive, in the order the server sends them. For a particular
+        order, put an <code>ORDER BY</code> in the statement.
+      </p>
+    {:else}
+      <p class="what" data-testid="export-summary">
+        {total.toLocaleString()} row{total === 1 ? '' : 's'}, {columns.length} column{columns.length === 1 ? '' : 's'}
+        {sort ? ', in the sorted order shown' : ''}
+      </p>
+      {#if truncated}
+        <p class="warn" data-testid="export-truncated">
+          The grid holds only the first {total.toLocaleString()} rows of the result, so that is all that will be
+          saved. Use <b>Export all rows</b> to write the whole result.
+        </p>
+      {/if}
     {/if}
 
     <label>
@@ -176,7 +166,9 @@
     {#if error}<p class="error" role="alert" data-testid="export-error">{error}</p>{/if}
 
     <div class="actions">
-      {#if busy && written > 0}<span class="progress">{written.toLocaleString()} / {total.toLocaleString()}</span>{/if}
+      {#if busy && written > 0 && scope === 'grid'}
+        <span class="progress">{written.toLocaleString()} / {total.toLocaleString()}</span>
+      {/if}
       <span class="spacer"></span>
       <button onclick={onclose} disabled={busy} data-testid="export-cancel">Cancel</button>
       <button class="primary" onclick={save} disabled={busy} data-testid="export-save">

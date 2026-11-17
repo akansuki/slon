@@ -1,4 +1,6 @@
 import { api, toPgError } from './api';
+import type { ExportDone, ExportRequest } from './api';
+import { extensionFor, labelFor, suggestName, type ExportOptions } from './export';
 import { looksLikeDdl, quoteIfNeeded } from './completion';
 import { parsePlan, type ParsedPlan } from './plan';
 import { diagnostics } from './about';
@@ -46,6 +48,8 @@ export class QueryTab {
   rows = $state.raw<Cell[][]>([]);
   rowsVersion = $state(0);
   truncated = $state(false);
+  /** Set by the last run when it also wrote a file, for the "saved" message. */
+  exported = $state<ExportDone | null>(null);
   /** Sort chosen in the grid (kept here so an export follows the order on screen). */
   sort = $state<SortSpec | null>(null);
   /** Indexes into `rows` of the whole rows selected in the grid, reported by it. */
@@ -176,7 +180,15 @@ export class QueryTab {
     return this.backendId !== null;
   }
 
-  async run(text: string, offset = 0) {
+  /**
+   * Run `text` and, with `exportTo` set, stream every row it returns to that file.
+   *
+   * One execution feeds both: the grid gets its first 100,000 rows as usual and says it was
+   * truncated, while the file gets the result entire. Re-running the query to export it
+   * would have meant a second, later snapshot — a file that disagrees with the preview that
+   * was approved.
+   */
+  async run(text: string, offset = 0, exportTo: ExportRequest | null = null) {
     await this.opening;
     if (this.status === 'running') return;
     if (this.backendId === null) {
@@ -201,38 +213,50 @@ export class QueryTab {
     const started = performance.now();
     let lastDoneAffected = 0;
     let switchedToMessages = false;
+    this.exported = null;
     try {
-      const summary = await api.runQuery(this.backendId, text, (ev) => {
-        switch (ev.type) {
-          case 'columns':
-            // A later result set replaces the earlier one; the grid shows the last.
-            this.columns = ev.columns;
-            this.rows = [];
-            this.truncated = false;
-            this.rowsVersion++;
-            break;
-          case 'rows': {
-            const target = this.rows;
-            for (const r of ev.rows) target.push(r);
-            this.rowsVersion++;
-            break;
-          }
-          case 'message':
-            this.messages.push(ev.message);
-            this.scheduleMessagesUpdate();
-            // A statement that only talks (a DO block reporting progress) has nothing else to
-            // show yet, so show the messages as they come in.
-            if (this.columns.length === 0 && this.view === 'results') {
-              this.view = 'messages';
-              switchedToMessages = true;
+      const { summary, exported } = await api.runQuery(
+        this.backendId,
+        text,
+        (ev) => {
+          switch (ev.type) {
+            case 'columns':
+              // A later result set replaces the earlier one; the grid shows the last.
+              this.columns = ev.columns;
+              this.rows = [];
+              this.truncated = false;
+              this.rowsVersion++;
+              break;
+            case 'rows': {
+              const target = this.rows;
+              for (const r of ev.rows) target.push(r);
+              this.rowsVersion++;
+              break;
             }
-            break;
-          case 'resultDone':
-            lastDoneAffected = ev.rowsAffected;
-            if (ev.hasColumns) this.truncated = ev.truncated;
-            break;
-        }
-      });
+            case 'message':
+              this.messages.push(ev.message);
+              this.scheduleMessagesUpdate();
+              // A statement that only talks (a DO block reporting progress) has nothing
+              // else to show yet, so show the messages as they come in.
+              if (this.columns.length === 0 && this.view === 'results') {
+                this.view = 'messages';
+                switchedToMessages = true;
+              }
+              break;
+            case 'resultDone':
+              lastDoneAffected = ev.rowsAffected;
+              if (ev.hasColumns) this.truncated = ev.truncated;
+              break;
+          }
+        },
+        exportTo,
+      );
+      this.exported = exported;
+      if (exported) {
+        app.flash(
+          `Saved ${exported.rows.toLocaleString()} row${exported.rows === 1 ? '' : 's'} to ${exported.path}`,
+        );
+      }
       this.elapsedMs = summary.elapsedMs;
       app.recordRun(this.database, text, {
         ok: true,
@@ -269,6 +293,24 @@ export class QueryTab {
       if (switchedToMessages && this.columns.length > 0) this.view = 'results';
       void this.resolveIdentity();
     }
+  }
+
+  /**
+   * Ask where to save, then run the statement and write every row it returns.
+   *
+   * Returns false when the save dialog was dismissed, so the caller can leave its own
+   * dialog open. Errors surface the same way a failed run does, in the tab.
+   */
+  async exportAll(text: string, options: ExportOptions, offset = 0): Promise<boolean> {
+    if (this.status === 'running') return false;
+    const path = await api.chooseExportPath(suggestName(options), labelFor(options), [
+      extensionFor(options),
+    ]);
+    if (path === null) return false;
+    // Deliberately not awaited: the dialog closes now and the tab shows the run, so a long
+    // export can be watched and cancelled like any other statement.
+    void this.run(text, offset, { path, options });
+    return true;
   }
 
   /**

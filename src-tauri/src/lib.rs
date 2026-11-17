@@ -169,29 +169,94 @@ fn close_tab(state: State<'_, AppState>, tab_id: u64) -> Result<(), PgError> {
     state.registry.close_tab(tab_id)
 }
 
+/// The row cap the grid is run with.
+///
+/// Debug builds accept `SLON_MAX_ROWS` so the end-to-end test can shrink it: the whole
+/// point of *Export all rows* is the gap between what the grid holds and what the file
+/// gets, and proving that with the real cap would mean generating 100,000 rows per check.
+fn query_options() -> QueryOptions {
+    let mut opts = QueryOptions::default();
+    if cfg!(debug_assertions) {
+        if let Some(n) = std::env::var("SLON_MAX_ROWS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+        {
+            opts.max_rows = n;
+        }
+    }
+    opts
+}
+
+/// Where *Export all rows* should write, when a run is also an export.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportRequest {
+    path: String,
+    options: pg_core::ExportOptions,
+}
+
+/// What the page needs for the "saved" message. Carried on the command's return value
+/// rather than the channel: unlike a row batch it has nothing to be ordered against.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportDone {
+    path: String,
+    rows: u64,
+}
+
 /// Streams `QueryEvent`s over `on_event`. Completion is signalled by a final
 /// `finished` / `failed` event on the same channel, so the frontend sees it strictly
 /// after the last row batch. The command itself only errors if the channel is gone.
+///
+/// With `export` set, every row additionally goes to that file as it streams, past the row
+/// cap that bounds what the grid is sent. One run feeds both, so the preview on screen and
+/// the file on disk come from the same execution rather than two of them.
 #[tauri::command]
 async fn run_query(
     state: State<'_, AppState>,
     tab_id: u64,
     sql: String,
+    export: Option<ExportRequest>,
     on_event: Channel<QueryEvent>,
-) -> Result<(), PgError> {
-    let result = state
-        .registry
-        .run_query(tab_id, &sql, &QueryOptions::default(), |event| {
-            // The frontend may have navigated away; losing events then is fine.
-            let _ = on_event.send(event);
-        })
-        .await;
+) -> Result<Option<ExportDone>, PgError> {
+    let emit = |event| {
+        // The frontend may have navigated away; losing events then is fine.
+        let _ = on_event.send(event);
+    };
+    let opts = query_options();
+
+    let (result, done) = match export {
+        None => (
+            state.registry.run_query(tab_id, &sql, &opts, emit).await,
+            None,
+        ),
+        Some(request) => {
+            let mut sink = export::FileSink::create(request.path.into(), request.options)?;
+            let result = state
+                .registry
+                .run_query_into(tab_id, &sql, &opts, emit, Some(&mut sink))
+                .await;
+            if result.is_ok() {
+                let done = ExportDone {
+                    path: sink.path().to_string_lossy().into_owned(),
+                    rows: sink.rows(),
+                };
+                (result, Some(done))
+            } else {
+                // Nothing usable was written, so leave no half-file behind.
+                sink.discard();
+                (result, None)
+            }
+        }
+    };
+
     let terminal = match result {
         Ok(summary) => QueryEvent::Finished { summary },
         Err(error) => QueryEvent::Failed { error },
     };
     let _ = on_event.send(terminal);
-    Ok(())
+    Ok(done)
 }
 
 #[tauri::command]
@@ -343,7 +408,7 @@ pub fn run() {
             workspace_load,
             workspace_save,
             export::choose_export_path,
-            export::write_export,
+            export::write_export_rows,
         ])
         .run(tauri::generate_context!())
         .expect("error while running slon");

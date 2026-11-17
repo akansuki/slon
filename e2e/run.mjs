@@ -35,6 +35,8 @@ function check(name, ok, info = '') {
 const CONFIG_HOME = mkdtempSync(join(tmpdir(), 'slon-e2e-config-'));
 // Where the app writes exports instead of opening a native save dialog (debug builds only).
 const EXPORT_DIR = mkdtempSync(join(tmpdir(), 'slon-e2e-export-'));
+/// Rows the grid keeps for this run. The real cap is 100,000.
+const GRID_CAP = 20000;
 const driver = spawn('tauri-driver', [], {
   stdio: ['ignore', 'inherit', 'inherit'],
   env: {
@@ -45,6 +47,9 @@ const driver = spawn('tauri-driver', [], {
     XDG_CACHE_HOME: mkdtempSync(join(tmpdir(), 'slon-e2e-cache-')),
     SLON_MEMORY_SECRETS: '1',
     SLON_EXPORT_DIR: EXPORT_DIR,
+    // A small grid cap (debug builds only), so the checks below can show the difference
+    // between what the grid keeps and what an export writes without 100,000 rows.
+    SLON_MAX_ROWS: String(GRID_CAP),
   },
 });
 await sleep(1500);
@@ -168,11 +173,12 @@ try {
   check('tab is usable after cancel', (await firstRowCells())?.includes('1'));
 
   /* ---------- row cap */
-  await run('SELECT g FROM generate_series(1, 150000) g');
+  await run(`SELECT g FROM generate_series(1, ${GRID_CAP * 3}) g`);
   await idle();
   // textContent, not getText: WebKit's getText omits text inside ellipsized elements.
   const capStatus = (await browser.execute(() => document.querySelector('.bodies > .body:not([hidden]) .status').textContent)).replace(/\s+/g, ' ');
-  check('row cap: 100,000 rows with truncation warning', capStatus.startsWith('100,000 rows') && capStatus.includes('Showing only the first'), capStatus);
+  check(`row cap: ${GRID_CAP.toLocaleString()} rows with truncation warning`,
+    capStatus.startsWith(`${GRID_CAP.toLocaleString()} rows`) && capStatus.includes('Showing only the first'), capStatus);
   await shot('04-truncated');
 
   /* ---------- tabs: independent connections */
@@ -858,6 +864,57 @@ try {
   await run('SELECT 1 WHERE false');
   await idle();
   check('Export is disabled when there are no rows', !(await (await browser.$(`${ACTIVE} [data-testid=export]`)).isEnabled()));
+
+  /* ---------- export all rows, past the grid's cap */
+  const doExportAll = async (sql, configure) => {
+    clearExports();
+    await setSql(sql);
+    await click(`${ACTIVE} [data-testid=export-all]`);
+    await until(async () => (await browser.$('[data-testid=export-dialog]')).isExisting(), 'export-all dialog did not open');
+    if (configure) await configure();
+    await click('[data-testid=export-save]');
+    await until(async () => !(await (await browser.$('[data-testid=export-dialog]')).isExisting()), 'export-all dialog did not close');
+    await idle();
+    const files = exportedFiles();
+    return files.length === 1 ? { name: files[0], body: readFileSync(join(EXPORT_DIR, files[0]), 'utf8') } : { name: files.join(','), body: '' };
+  };
+
+  // More rows than the grid will hold: the file must have all of them anyway.
+  const overCap = GRID_CAP + 1234;
+  const whole = await doExportAll(`SELECT g AS n FROM generate_series(1, ${overCap}) g`, plainCsv);
+  const wholeLines = whole.body.split('\r\n');
+  check('Export all rows writes every row, past the grid cap',
+    wholeLines.length === overCap + 1 && wholeLines[0] === '1' && wholeLines[overCap - 1] === String(overCap),
+    `${wholeLines.length} lines, last ${JSON.stringify(wholeLines[overCap - 1])}`);
+
+  const capStatusAfter = (await browser.execute(() => document.querySelector('.bodies > .body:not([hidden]) .status').textContent)).replace(/\s+/g, ' ');
+  check('the grid still shows only its cap while the file got everything',
+    capStatusAfter.startsWith(`${GRID_CAP.toLocaleString()} rows`) && capStatusAfter.includes(`${overCap.toLocaleString()} rows written to file`), capStatusAfter);
+  check('no .part file is left behind', !exportedFiles().some((f) => f.endsWith('.part')), exportedFiles().join(','));
+
+  // Format options apply to the streamed file too.
+  const streamedJson = await doExportAll(
+    "SELECT 1 AS id, 'ž' AS c, NULL AS n UNION ALL SELECT 2, 'x', 'v'",
+    choose('export-format', 'json'),
+  );
+  let streamedParsed = null;
+  try { streamedParsed = JSON.parse(streamedJson.body); } catch (e) { streamedParsed = String(e); }
+  check('Export all rows honours the chosen format',
+    streamedJson.name.endsWith('.json') && Array.isArray(streamedParsed) && streamedParsed.length === 2
+      && streamedParsed[0].id === 1 && streamedParsed[0].n === null && streamedParsed[1].c === 'x',
+    streamedJson.body.slice(0, 200));
+
+  // A script cannot be streamed into one file, and nothing is written when it is refused.
+  clearExports();
+  await setSql('SELECT 1; SELECT 2');
+  await click(`${ACTIVE} [data-testid=export-all]`);
+  await until(async () => (await browser.$('[data-testid=export-dialog]')).isExisting(), 'export-all dialog did not open for a script');
+  await click('[data-testid=export-save]');
+  await idle();
+  const scriptError = await text(`${ACTIVE} .banner`).catch(() => '');
+  check('a script is refused rather than half-written',
+    scriptError.toLowerCase().includes('one statement') || scriptError.toLowerCase().includes('multiple commands'), scriptError);
+  check('a refused export leaves no file at all', exportedFiles().length === 0, exportedFiles().join(','));
 
   /* ---------- query history */
   const historyEntries = () =>

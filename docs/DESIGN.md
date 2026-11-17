@@ -97,15 +97,43 @@ bare column names are suggested from the tables the *current statement* mentions
 a statement containing `CREATE`/`ALTER`/`DROP`, and with the *Refresh names* button. Limits: comma-joined
 tables (`FROM a, b`), CTE and subquery column names are not resolved.
 
-**Export.** The *Export* button saves what the grid holds (at most the 100,000 rows it keeps, in the
-sorted order currently shown) as CSV/TSV, JSON (array of objects) or JSON Lines. The file is chosen in
-the native save dialog, which is opened by the Rust side; the page can only write to a path that dialog
-just returned, and only `.csv/.tsv/.json/.jsonl/.txt`. CSV follows RFC 4180 (CRLF line ends); like
-`COPY ... CSV`, NULL is an empty field and an empty string is `""`. A UTF-8 byte order mark is on by
-default because Excel on Windows otherwise garbles č, ć, š, đ. In JSON, numbers keep the digits the server
-sent (no float rounding of bigint/numeric), booleans become true/false, json/jsonb values are embedded as
-JSON, and everything else is a string. Rows are written in 5,000-row chunks. Options are remembered.
-The end-to-end test sets `SLON_EXPORT_DIR` (debug builds only) to skip the native dialog.
+**Export.** Two ways out, one file format. *Export* saves what the grid holds (at most the 100,000 rows
+it keeps, in the sorted order currently shown). *Export all rows* ignores that cap: it runs the statement
+and writes every row the server returns straight to disk. Both offer CSV/TSV, JSON (array of objects) and
+JSON Lines, and both remember their options. The file is chosen in the native save dialog, which is
+opened by the Rust side; the page can only write to a path that dialog just returned, and only
+`.csv/.tsv/.json/.jsonl/.txt`. CSV follows RFC 4180 (CRLF line ends); like `COPY ... CSV`, NULL is an
+empty field and an empty string is `""`. A UTF-8 byte order mark is on by default because Excel on
+Windows otherwise garbles č, ć, š, đ. In JSON, numbers keep the digits the server sent (no float rounding
+of bigint/numeric), booleans become true/false, json/jsonb values are embedded as JSON, and everything
+else is a string. The end-to-end test sets `SLON_EXPORT_DIR` (debug builds only) to skip the native
+dialog, and `SLON_MAX_ROWS` to shrink the grid's cap so the gap between the two paths is testable without
+100,000 rows.
+
+**Export all rows: one run, two sinks.** The obvious way to lift the cap — re-run the query and stream
+that — means a second, later snapshot: a file that can disagree with the preview it was started from, and
+a sort order that cannot be reproduced because the grid's sort is a client-side comparator over rows the
+file never passes through. So the file is chosen *first* and the statement runs once, feeding both. The
+grid still gets its first 100,000 rows and still says it was truncated; a `RowSink` handed to the query
+engine gets every row as it streams past, and the early cancel that normally stops the server at the cap
+is suppressed. Rows written this way never reach the page at all, so the result is bounded by the disk
+rather than by memory: two million rows (143 MB) exported in 2.9 s with the engine's peak RSS at 5 MB.
+The file comes out in the server's order — `ORDER BY` is the way to choose one, which is also what
+pgAdmin's cursor-based grid leaves you with.
+
+A sink writes one result set into one file, so anything that would produce a different number of them is
+refused before a single row moves: the `prepare` that already runs for column types also tells us whether
+this is one statement, and whether it returns rows at all. Bytes go to `<name>.part` and the file is
+renamed only once it is complete, so a cancelled, failed or refused export never leaves something that
+looks finished — and `finish()` is called only on the way out of a run that did not fail.
+
+**One formatter, in Rust.** The CSV/JSON formatting used to live in TypeScript, which worked while the
+only source of rows was the grid. Streaming made that untenable: rows that must not pass through the page
+cannot be formatted by it, so there would have been two implementations of one file format that must
+agree byte for byte. The formatter is now `crates/pg-core/src/export.rs` and the grid's export sends rows
+to it rather than finished text. The port was checked by running both implementations over the same
+awkward fixture — NaN, 2^53+1, `01`, embedded jsonb, CRLF, BOM, control characters, duplicate column
+names — and diffing the bytes.
 
 **Query history.** Every run (not Explain) is recorded in `history.json` in the config folder: the statement, server
 (`user@host:port`), database, success or the error, duration, rows. The *History* button (Ctrl+H) opens a panel with

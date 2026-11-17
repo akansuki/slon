@@ -11,7 +11,7 @@ use crate::explain::{self, ExplainResult};
 use crate::gridedit::{
     self, DeleteOutcome, DeletePlan, DeleteRequest, RowIdentity, UpdateOutcome, UpdateRequest,
 };
-use crate::query::{self, QueryEvent, QueryOptions, QuerySummary};
+use crate::query::{self, QueryEvent, QueryOptions, QuerySummary, RowSink};
 use crate::session::Session;
 
 #[derive(Debug, Clone, Serialize)]
@@ -203,8 +203,23 @@ impl Registry {
     where
         F: FnMut(QueryEvent),
     {
+        self.run_query_into(tab_id, sql, opts, emit, None).await
+    }
+
+    /// `run_query` with a sink that receives every row, past the grid's cap.
+    pub async fn run_query_into<F>(
+        &self,
+        tab_id: u64,
+        sql: &str,
+        opts: &QueryOptions,
+        emit: F,
+        sink: Option<&mut (dyn RowSink + Send)>,
+    ) -> Result<QuerySummary, PgError>
+    where
+        F: FnMut(QueryEvent),
+    {
         let session = self.tab_session(tab_id)?;
-        query::run_query(&session, sql, opts, emit).await
+        query::run_query_into(&session, sql, opts, emit, sink).await
     }
 
     /// Shows the plan of one statement. With `analyze` the statement is executed and rolled back.

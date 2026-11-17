@@ -19,7 +19,7 @@ This is a **vertical slice**, not a pgAdmin clone. It does these things and trie
 | Results | virtualized grid, type-aware **client-side sorting**, streamed in batches; cell and row **selection and copy** (tab-separated, pastes into Excel); **resizable columns** |
 | Explain | **Explain** and **Explain analyze** in a plan tree with per-node time share, bad row estimates, spills to disk and other warnings |
 | Messages | `RAISE NOTICE`, warnings and `VACUUM VERBOSE` output in their own tab, live while the statement runs |
-| Export | the grid's rows as **CSV, TSV, JSON or JSON Lines**, in the sorted order shown |
+| Export | the grid's rows as **CSV, TSV, JSON or JSON Lines**, in the sorted order shown — or **Export all rows** to stream a whole result past the 100,000-row grid limit straight to disk |
 | Edit | switch on **Edit** and type into a cell: one UPDATE, guarded against a row someone else changed; Ctrl+0 writes NULL |
 | Delete | select whole rows and **delete them without writing SQL** — only where the rows trace back to one table with a primary key; the exact statement is shown first and rolled back unless it matches |
 | History | every statement you ran, searchable, reopened in a tab (`Ctrl+H`); password-looking statements are never recorded |
@@ -106,7 +106,7 @@ scripts/          test-db.sh starts a throwaway PostgreSQL cluster for the tests
 - Import/export of saved connections, folders/groups
 - Client certificates, SSH tunnels, `.pgpass` / service files
 - `COPY` (the protocol-level kind used by `COPY ... FROM STDIN`)
-- Copy as INSERT/JSON, export of *all* rows of a result larger than the 100,000-row grid cap (needs a re-run)
+- Copy as INSERT/JSON
 - Autocomplete for CTEs/subqueries, functions and types
 - Grants, rules, policies in table properties
 - Code-signed installers

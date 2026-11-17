@@ -275,6 +275,133 @@ async fn row_cap_truncates_without_poisoning_the_next_query() {
     }
 }
 
+/// Collects what a sink is given, so a test can check it against what the grid got.
+#[derive(Default)]
+struct Captured {
+    columns: Vec<String>,
+    rows: Vec<Vec<Option<String>>>,
+    finished: bool,
+}
+
+impl pg_core::RowSink for Captured {
+    fn start(&mut self, columns: &[Column]) -> Result<(), PgError> {
+        self.columns = columns.iter().map(|c| c.name.clone()).collect();
+        Ok(())
+    }
+    fn row(&mut self, cells: &[Option<String>]) -> Result<(), PgError> {
+        self.rows.push(cells.to_vec());
+        Ok(())
+    }
+    fn finish(&mut self) -> Result<(), PgError> {
+        self.finished = true;
+        Ok(())
+    }
+}
+
+/// The whole point of the sink: the grid keeps its cap, the file gets everything.
+///
+/// The server must also be left alone to finish — the cancel that normally stops it at the
+/// cap would cut the export short, and silently, since a cancel at the cap is not an error.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sink_receives_every_row_while_the_grid_stays_capped() {
+    let cfg = cfg_or_skip!();
+    let reg = Registry::new();
+    let t = tab(&reg, &cfg).await;
+    let opts = QueryOptions {
+        max_rows: 100,
+        batch_size: 30,
+    };
+    let mut sink = Captured::default();
+    let mut c = Collected::default();
+
+    let summary = reg
+        .run_query_into(
+            t,
+            "SELECT g AS n FROM generate_series(1, 5000) g",
+            &opts,
+            |ev| match ev {
+                QueryEvent::Columns { columns, .. } => {
+                    c.columns.push(columns);
+                    c.rows.push(vec![]);
+                }
+                QueryEvent::Rows { rows, .. } => c.rows.last_mut().unwrap().extend(rows),
+                QueryEvent::ResultDone {
+                    rows_affected,
+                    row_count,
+                    has_columns,
+                    truncated,
+                    ..
+                } => c
+                    .done
+                    .push((rows_affected, row_count, has_columns, truncated)),
+                _ => {}
+            },
+            Some(&mut sink),
+        )
+        .await
+        .unwrap();
+
+    assert!(summary.truncated, "the grid's view is cut short");
+    assert_eq!(c.rows[0].len(), 100, "the grid keeps its cap");
+    assert_eq!(sink.rows.len(), 5000, "the sink gets the whole result");
+    assert_eq!(sink.columns, ["n"]);
+    assert!(sink.finished);
+    assert_eq!(
+        sink.rows[4999][0],
+        s("5000"),
+        "right through to the last row"
+    );
+    // The server ran to completion rather than being cancelled at the cap.
+    assert_eq!(c.done[0].0, 5000, "rows_affected");
+
+    // And the connection is still usable afterwards.
+    let (res, c) = run(&reg, t, "SELECT 'next'", &QueryOptions::default()).await;
+    res.unwrap();
+    assert_eq!(c.rows[0][0][0], s("next"));
+}
+
+/// A sink that fails stops the run and reports why, rather than finishing a broken file.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failing_sink_stops_the_query() {
+    struct Fails(usize);
+    impl pg_core::RowSink for Fails {
+        fn start(&mut self, _: &[Column]) -> Result<(), PgError> {
+            Ok(())
+        }
+        fn row(&mut self, _: &[Option<String>]) -> Result<(), PgError> {
+            self.0 += 1;
+            if self.0 > 10 {
+                return Err(PgError::new(pg_core::ErrorKind::Storage, "disk full"));
+            }
+            Ok(())
+        }
+        fn finish(&mut self) -> Result<(), PgError> {
+            panic!("must not be called after a failure")
+        }
+    }
+
+    let cfg = cfg_or_skip!();
+    let reg = Registry::new();
+    let t = tab(&reg, &cfg).await;
+    let mut sink = Fails(0);
+    let err = reg
+        .run_query_into(
+            t,
+            "SELECT g FROM generate_series(1, 5000) g",
+            &QueryOptions::default(),
+            |_| {},
+            Some(&mut sink),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.message, "disk full");
+
+    // The tab is not left busy or mid-result.
+    let (res, c) = run(&reg, t, "SELECT 'next'", &QueryOptions::default()).await;
+    res.unwrap();
+    assert_eq!(c.rows[0][0][0], s("next"));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn scripts_are_never_cancelled_at_the_row_cap() {
     let cfg = cfg_or_skip!();

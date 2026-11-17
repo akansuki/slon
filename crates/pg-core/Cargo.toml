@@ -14,3 +14,6 @@ serde = { version = "1", features = ["derive"] }
 futures-util = "0.3"
 # Trusted CA certificates of the operating system (Windows certificate store, ...).
 rustls-native-certs = "0.8"
+
+[dev-dependencies]
+serde_json = "1"

@@ -111,6 +111,19 @@ pub struct QueryOptions {
     pub batch_size: usize,
 }
 
+/// Somewhere every row goes, however few of them the grid is willing to hold.
+///
+/// This is what makes "export all rows" possible without lifting the row cap: the cap
+/// governs what reaches the UI, and a sink — if there is one — sees the whole result as it
+/// streams past. Implementors write to a file; nothing here knows that.
+pub trait RowSink {
+    /// The result set is starting. Called once, before any row.
+    fn start(&mut self, columns: &[Column]) -> Result<(), PgError>;
+    fn row(&mut self, cells: &[Option<String>]) -> Result<(), PgError>;
+    /// Every row has been handed over. Not called when the query fails.
+    fn finish(&mut self) -> Result<(), PgError>;
+}
+
 impl Default for QueryOptions {
     fn default() -> Self {
         Self {
@@ -128,11 +141,18 @@ impl Default for QueryOptions {
 ///
 /// Column types come from a `prepare` beforehand, which only succeeds for a single
 /// statement; scripts fall back to untyped columns.
-pub async fn run_query<F>(
+///
+/// Every row is additionally handed to `sink`, if there is one. The row cap then applies
+/// only to what the UI is sent: the grid still shows its first `max_rows` and says it was
+/// truncated, while the sink sees the result to the last row. The early cancel that normally
+/// stops the server at the cap is suppressed, because with a sink attached the rest of the
+/// result is the whole point.
+pub async fn run_query_into<F>(
     session: &Session,
     sql: &str,
     opts: &QueryOptions,
     mut emit: F,
+    mut sink: Option<&mut (dyn RowSink + Send)>,
 ) -> Result<QuerySummary, PgError>
 where
     F: FnMut(QueryEvent),
@@ -142,7 +162,8 @@ where
     // Whatever arrived before this statement belongs to something else.
     session.notices.clear();
 
-    let described: Option<Vec<Column>> = session.client.prepare(sql).await.ok().map(|stmt| {
+    let prepared = session.client.prepare(sql).await;
+    let described: Option<Vec<Column>> = prepared.as_ref().ok().map(|stmt| {
         stmt.columns()
             .iter()
             .map(|c| Column {
@@ -156,6 +177,32 @@ where
     });
     // A successful prepare means exactly one statement.
     let single_statement = described.is_some();
+
+    // A sink writes one result set into one file, so anything that would produce a different
+    // number of them is refused before a single row moves — not reported halfway through a
+    // file that is already on disk.
+    if sink.is_some() {
+        match &prepared {
+            Ok(stmt) if stmt.columns().is_empty() => {
+                return Err(PgError::new(
+                    ErrorKind::Query,
+                    "That statement returns no rows, so there is nothing to write.",
+                ));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                let mut err = PgError::from_driver(e, ErrorKind::Query);
+                if err.message.contains("multiple commands") {
+                    err.hint = Some(
+                        "Only one statement at a time can be written to a file. \
+                         Select the statement you want, then try again."
+                            .into(),
+                    );
+                }
+                return Err(err);
+            }
+        }
+    }
 
     let stream = session
         .client
@@ -246,14 +293,26 @@ where
                         .collect(),
                 };
                 in_result_set = true;
+                if let Some(sink) = sink.as_deref_mut() {
+                    sink.start(&columns)?;
+                }
                 emit(QueryEvent::Columns {
                     result_index,
                     columns,
                 });
             }
             Ok(SimpleQueryMessage::Row(row)) => {
-                if truncated {
+                if truncated && sink.is_none() {
                     continue; // draining what the server already sent
+                }
+                let cells: Vec<Option<String>> = (0..row.len())
+                    .map(|i| row.get(i).map(str::to_owned))
+                    .collect();
+                if let Some(sink) = sink.as_deref_mut() {
+                    sink.row(&cells)?;
+                }
+                if truncated {
+                    continue; // the grid has all it will take; the sink is still listening
                 }
                 if row_count >= opts.max_rows {
                     truncated = true;
@@ -261,8 +320,9 @@ where
                     flush!();
                     // For a single statement it is safe to stop the server early. For
                     // scripts we keep draining instead: an error would roll back the
-                    // implicit transaction that wraps the whole script.
-                    if single_statement {
+                    // implicit transaction that wraps the whole script. With a sink the
+                    // remaining rows are wanted, so the server is left to finish.
+                    if single_statement && sink.is_none() {
                         let handle = session.cancel_handle();
                         tokio::spawn(async move {
                             let _ = handle.cancel().await;
@@ -270,11 +330,7 @@ where
                     }
                     continue;
                 }
-                pending.push(
-                    (0..row.len())
-                        .map(|i| row.get(i).map(str::to_owned))
-                        .collect(),
-                );
+                pending.push(cells);
                 row_count += 1;
                 if pending.len() >= opts.batch_size {
                     flush!();
@@ -319,6 +375,11 @@ where
     }
 
     close_messages!();
+    // Only on the way out, and only when nothing failed: a half-written file must not be
+    // closed off as though it were complete.
+    if let Some(sink) = sink {
+        sink.finish()?;
+    }
     Ok(QuerySummary {
         elapsed_ms: started.elapsed().as_millis() as u64,
         statements,
