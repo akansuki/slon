@@ -128,43 +128,45 @@
 
 <div class="pane" bind:this={pane}>
   <div class="toolbar">
-    <button class="primary" onclick={run} disabled={tab.status !== 'idle'} title="Run (Ctrl+Enter or F5). Runs the selection if there is one.">
-      <Icon name="play" size={14} /> Run
+    <button class="primary" onclick={run} disabled={tab.status !== 'idle'} title={'Run\nCtrl+Enter or F5. Runs the selection if there is one.'}>
+      <Icon name="play" size={14} /><span class="label">Run</span>
     </button>
-    <button onclick={() => tab.cancel()} disabled={!running} title="Cancel the running query">
-      <Icon name="stop" size={14} /> Cancel
+    <button onclick={() => tab.cancel()} disabled={!running} title={'Cancel\nStop the running query.'}>
+      <Icon name="stop" size={14} /><span class="label">Cancel</span>
     </button>
     <button
       onclick={() => explain(false)}
       disabled={tab.status !== 'idle'}
-      title="Show the execution plan the server would use. The statement is not run."
+      title={'Explain\nShow the execution plan the server would use. The statement is not run.'}
       data-testid="explain"
     >
-      <Icon name="plan" size={14} /> Explain
+      <Icon name="plan" size={14} /><span class="label">Explain</span>
     </button>
     <button
+      class="lesser"
       onclick={() => explain(true)}
       disabled={tab.status !== 'idle'}
-      title="Run the statement and show the real plan with timings. Changes are rolled back."
+      title={'Explain analyze\nRun the statement and show the real plan with timings. Changes are rolled back.'}
       data-testid="explain-analyze"
     >
-      <Icon name="plan" size={14} /> Explain analyze
+      <Icon name="stopwatch" size={14} /><span class="label">Explain analyze</span>
     </button>
     <button
       onclick={() => (exporting = 'grid')}
       disabled={!canExport}
-      title="Save the rows in the grid as CSV or JSON"
+      title={'Export\nSave the rows the grid holds as CSV, TSV, JSON or JSON Lines.'}
       data-testid="export"
     >
-      <Icon name="export" size={14} /> Export
+      <Icon name="export" size={14} /><span class="label">Export</span>
     </button>
     <button
+      class="lesser"
       onclick={() => (exporting = 'all')}
       disabled={!canExportAll}
-      title="Run the statement and write every row it returns to a file, past the grid's 100,000-row limit"
+      title={'Export all rows\nRun the statement and write every row it returns straight to a file, past the grid\u2019s 100,000-row limit.'}
       data-testid="export-all"
     >
-      <Icon name="export" size={14} /> Export all rows
+      <Icon name="exportAll" size={14} /><span class="label">Export all rows</span>
     </button>
 <!-- A switch, not a button: it turns writing on for the whole grid, so it should not look
          like the one-shot actions beside it. -->
@@ -174,32 +176,35 @@
       aria-checked={tab.editMode}
       onclick={() => (tab.editMode = !tab.editMode)}
       disabled={!anyEditable || running}
-      title={anyEditable
-        ? 'Let cells be edited: double-click a cell, Enter saves, Ctrl+0 sets NULL'
-        : editReason}
+      title={`${tab.editMode ? 'Editing' : 'Edit'}\n${
+        anyEditable ? 'Let cells be edited: double-click a cell, Enter saves, Ctrl+0 sets NULL.' : editReason
+      }`}
       data-testid="edit-mode"
     >
       <span class="track"><span class="knob"></span></span>
-      {tab.editMode ? 'Editing' : 'Edit'}
+      <span class="label">{tab.editMode ? 'Editing' : 'Edit'}</span>
     </button>
     <button
+      class="lesser"
       onclick={() => (deleting = true)}
       disabled={!canDelete.ok}
-      title={canDelete.ok
-        ? `Delete the selected rows from ${tab.identity?.schema}.${tab.identity?.table}`
-        : canDelete.reason}
+      title={`Delete rows\n${
+        canDelete.ok
+          ? `Delete the selected rows from ${tab.identity?.schema}.${tab.identity?.table}.`
+          : canDelete.reason
+      }`}
       data-testid="delete-rows"
     >
-      <Icon name="trash" size={14} /> Delete rows
+      <Icon name="trash" size={14} /><span class="label">Delete rows</span>
     </button>
     <button
-      class="ghost"
+      class="ghost lesser"
       onclick={() => tab.loadCompletion()}
       disabled={tab.completionLoading}
-      title="Reload table and column names used for autocompletion"
+      title={'Refresh names\nReload the table and column names used for autocompletion.'}
       data-testid="refresh-schema"
     >
-      <Icon name="refresh" size={14} /> Refresh names
+      <Icon name="refresh" size={14} /><span class="label">Refresh names</span>
     </button>
     <span class="spacer"></span>
     <span class="db" title="Database of this tab"><Icon name="database" size={14} /> {tab.database}</span>
@@ -326,6 +331,7 @@
     flex-direction: column;
     height: 100%;
     min-height: 0;
+    container: pane / inline-size;
   }
   .toggle {
     display: flex;
@@ -374,6 +380,30 @@
     padding: 6px 10px;
     border-bottom: 1px solid var(--border);
     background: var(--panel);
+  }
+  /* Buttons are a fixed height, so a label that wraps is a label that gets cut off.
+     Rather than let them shrink, they give up their text: every one has a title, and
+     the icon stays. The longer, less-used actions go first so that a pane only
+     slightly too narrow does not turn into a row of anonymous icons. */
+  .toolbar button {
+    flex: none;
+    white-space: nowrap;
+  }
+  @container pane (max-width: 1000px) {
+    .toolbar button.lesser .label {
+      display: none;
+    }
+    .toolbar button.lesser:not(.ghost) {
+      padding: 0 8px;
+    }
+  }
+  @container pane (max-width: 680px) {
+    .toolbar button:not(.primary) .label {
+      display: none;
+    }
+    .toolbar button:not(.primary):not(.ghost) {
+      padding: 0 8px;
+    }
   }
   .spacer {
     flex: 1;

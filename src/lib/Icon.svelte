@@ -33,6 +33,12 @@
     export: { d: 'M8 10V2.5M5 5l3-3 3 3M3 9.5v4h10v-4' },
     copy: { d: 'M5.5 5.5h7v8h-7zM3.5 10.5v-8h7' },
     plan: { d: 'M8 2v3.5M8 5.5H3.5V9M8 5.5h4.5V9M2 9h3v4H2zM11 9h3v4h-3zM6.5 9h3v4h-3z' },
+    // Explain analyze actually runs the statement and times it, so it gets a stopwatch
+    // rather than a second copy of the plan icon: at icon-only widths the two sit side by
+    // side and must be tellable apart at a glance.
+    stopwatch: { d: 'M8 3.6a5.2 5.2 0 1 0 0 10.4 5.2 5.2 0 0 0 0-10.4zM8 6.2v2.8l1.9 1.1M6.2 1.8h3.6M8 1.8v1.8' },
+    // The same tray as `export`, with a second chevron: more than what is on screen.
+    exportAll: { d: 'M3 9.5v4h10v-4M8 9.5V2.2M5 7.6l3-3 3 3M5 4.6l3-3 3 3' },
     alert: { d: 'M8 2.2l6.3 11H1.7zM8 6.5v3M8 11.5h.01' },
   };
 
